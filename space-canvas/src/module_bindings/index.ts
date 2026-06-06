@@ -38,6 +38,7 @@ import ClaimTurfReducer from "./claim_turf_reducer";
 import ClearDerivedDataReducer from "./clear_derived_data_reducer";
 import CompleteTurfReducer from "./complete_turf_reducer";
 import ImportDerivedDataBatchReducer from "./import_derived_data_batch_reducer";
+import ImportDerivedDataJsonBatchReducer from "./import_derived_data_json_batch_reducer";
 import ImportRegisteredVotersReducer from "./import_registered_voters_reducer";
 import ResetDemoDataReducer from "./reset_demo_data_reducer";
 import SeedSimulationReducer from "./seed_simulation_reducer";
@@ -173,6 +174,7 @@ const reducersSchema = __reducers(
   __reducerSchema("clear_derived_data", ClearDerivedDataReducer),
   __reducerSchema("complete_turf", CompleteTurfReducer),
   __reducerSchema("import_derived_data_batch", ImportDerivedDataBatchReducer),
+  __reducerSchema("import_derived_data_json_batch", ImportDerivedDataJsonBatchReducer),
   __reducerSchema("import_registered_voters", ImportRegisteredVotersReducer),
   __reducerSchema("reset_demo_data", ResetDemoDataReducer),
   __reducerSchema("seed_simulation", SeedSimulationReducer),

@@ -466,58 +466,18 @@ export const importDerivedDataBatch = spacetimedb.reducer(
     finalBatch: t.bool(),
   },
   (ctx, { turfs, voters, finalBatch }) => {
-    for (const row of turfs) {
-      ctx.db.turf.insert(row);
-      ensureTurfStatsRow(ctx, row.id);
-    }
+    importDerivedRows(ctx, turfs, voters, finalBatch);
+  }
+);
 
-    const touchedTurfs: Record<number, boolean> = {};
-    for (const row of voters) {
-      ctx.db.voter.insert({
-        id: row.id,
-        turf_id: row.turf_id,
-        household_key: row.household_key,
-        registered_voter_count: row.registered_voter_count,
-        household_name: row.household_name,
-        address: row.address,
-        precinct: row.precinct,
-        source_city: row.source_city,
-        source_zip5: row.source_zip5,
-        lat: row.lat,
-        lng: row.lng,
-        status: STATUS_NOT_CONTACTED,
-        last_contacted_at: undefined,
-        last_contacted_by: undefined,
-        attempt_count: 0,
-        donation_cents: 0,
-        updated_seq: 0,
-      });
-      incrementImportedTurfStats(ctx, row.turf_id, row.registered_voter_count);
-      touchedTurfs[row.turf_id] = true;
-    }
-
-    for (const turfIdText of Object.keys(touchedTurfs)) {
-      const turfId = Number(turfIdText);
-      const stats = ctx.db.turfStats.turf_id.find(turfId);
-      if (stats) {
-        stats.update_count += 1;
-        ctx.db.turfStats.turf_id.update(stats);
-      }
-    }
-
-    if (finalBatch) {
-      upsertSimState(ctx, 0, false, 0, 0);
-      logActivity(ctx, {
-        turfId: turfs[0]?.id ?? 1,
-        voterId: undefined,
-        volunteerId: undefined,
-        eventType: 'materialization_complete',
-        status: 'active',
-        message: `Imported ${ctx.db.voter.count()} household knock targets from registered voters`,
-        lat: TRAVIS_CENTER.lat,
-        lng: TRAVIS_CENTER.lng,
-      });
-    }
+export const importDerivedDataJsonBatch = spacetimedb.reducer(
+  {
+    payloadJson: t.string(),
+    finalBatch: t.bool(),
+  },
+  (ctx, { payloadJson, finalBatch }) => {
+    const parsed = JSON.parse(payloadJson);
+    importDerivedRows(ctx, parsed.turfs ?? [], parsed.voters ?? [], finalBatch);
   }
 );
 
@@ -826,7 +786,8 @@ function seedData(ctx: any) {
 }
 
 function ensureTurfStatsRow(ctx: any, turfId: number) {
-  if (ctx.db.turfStats.turfId.find(turfId)) {
+  const turfStats = turfStatsAccessor(ctx);
+  if (turfStats.find(turfId)) {
     return;
   }
   ctx.db.turfStats.insert({
@@ -843,16 +804,130 @@ function ensureTurfStatsRow(ctx: any, turfId: number) {
   });
 }
 
+function normalizeImportedTurf(row: any) {
+  return {
+    id: row.id,
+    name: row.name,
+    neighborhood: row.neighborhood,
+    center_lat: row.center_lat ?? row.centerLat,
+    center_lng: row.center_lng ?? row.centerLng,
+    boundary: row.boundary,
+    walk_route: row.walk_route ?? row.walkRoute,
+  };
+}
+
+function normalizeImportedVoter(row: any) {
+  return {
+    id: row.id,
+    turfId: row.turf_id ?? row.turfId,
+    householdKey: row.household_key ?? row.householdKey,
+    registeredVoterCount:
+      row.registered_voter_count ?? row.registeredVoterCount,
+    householdName: row.household_name ?? row.householdName,
+    address: row.address,
+    precinct: row.precinct,
+    sourceCity: row.source_city ?? row.sourceCity,
+    sourceZip5: row.source_zip5 ?? row.sourceZip5,
+    lat: row.lat,
+    lng: row.lng,
+  };
+}
+
+function importDerivedRows(
+  ctx: any,
+  turfs: any[],
+  voters: any[],
+  finalBatch: boolean
+) {
+  for (const row of turfs) {
+    const turfRow = normalizeImportedTurf(row);
+    const existing = ctx.db.turf.id.find(turfRow.id);
+    if (existing) {
+      Object.assign(existing, turfRow);
+      ctx.db.turf.id.update(existing);
+    } else {
+      ctx.db.turf.insert(turfRow);
+    }
+    ensureTurfStatsRow(ctx, turfRow.id);
+  }
+
+  const touchedTurfs: Record<number, boolean> = {};
+  for (const row of voters) {
+    const imported = normalizeImportedVoter(row);
+    const existing = ctx.db.voter.id.find(imported.id);
+    const voterRow = {
+      id: imported.id,
+      turf_id: imported.turfId,
+      household_key: imported.householdKey,
+      registered_voter_count: imported.registeredVoterCount,
+      household_name: imported.householdName,
+      address: imported.address,
+      precinct: imported.precinct,
+      source_city: imported.sourceCity,
+      source_zip5: imported.sourceZip5,
+      lat: imported.lat,
+      lng: imported.lng,
+      status: STATUS_NOT_CONTACTED,
+      last_contacted_at: undefined,
+      last_contacted_by: undefined,
+      attempt_count: 0,
+      donation_cents: 0,
+      updated_seq: 0,
+    };
+    if (existing) {
+      Object.assign(existing, voterRow);
+      ctx.db.voter.id.update(existing);
+    } else {
+      ctx.db.voter.insert(voterRow);
+      incrementImportedTurfStats(
+        ctx,
+        imported.turfId,
+        imported.registeredVoterCount
+      );
+    }
+    touchedTurfs[imported.turfId] = true;
+  }
+
+  for (const turfIdText of Object.keys(touchedTurfs)) {
+    const turfId = Number(turfIdText);
+    const turfStats = ctx.db.turfStats.turfId ?? ctx.db.turfStats.turf_id;
+    const stats = turfStats.find(turfId);
+    if (stats) {
+      stats.update_count += 1;
+      turfStats.update(stats);
+    }
+  }
+
+  if (finalBatch) {
+    upsertSimState(ctx, 0, false, 0, 0);
+    logActivity(ctx, {
+      turfId: turfs[0]?.id ?? 1,
+      voterId: undefined,
+      volunteerId: undefined,
+      eventType: 'materialization_complete',
+      status: 'active',
+      message: `Imported ${ctx.db.voter.count()} household knock targets from registered voters`,
+      lat: TRAVIS_CENTER.lat,
+      lng: TRAVIS_CENTER.lng,
+    });
+  }
+}
+
 function incrementImportedTurfStats(ctx: any, turfId: number, voterCount: number) {
   ensureTurfStatsRow(ctx, turfId);
-  const stats = ctx.db.turfStats.turfId.find(turfId);
+  const turfStats = turfStatsAccessor(ctx);
+  const stats = turfStats.find(turfId);
   if (!stats) {
     return;
   }
   const weight = Math.max(1, voterCount);
   stats.total_voters += weight;
   stats.not_contacted_count += weight;
-  ctx.db.turfStats.turfId.update(stats);
+  turfStats.update(stats);
+}
+
+function turfStatsAccessor(ctx: any) {
+  return ctx.db.turfStats.turf_id ?? ctx.db.turfStats.turfId;
 }
 
 function seedRegisteredVoterHouseholds(ctx: any) {
@@ -1261,12 +1336,12 @@ function hashString(value: string) {
 
 function clearTable(ctx: any, accessorName: string) {
   const ids = Array.from(ctx.db[accessorName].iter()).map((row: any) => row.id ?? row.turf_id);
+  const tableAccessor =
+    accessorName === 'turfStats'
+      ? turfStatsAccessor(ctx)
+      : ctx.db[accessorName].id;
   for (const id of ids) {
-    if (accessorName === 'turfStats') {
-      ctx.db[accessorName].turfId.delete(id);
-    } else {
-      ctx.db[accessorName].id.delete(id);
-    }
+    tableAccessor.delete(id);
   }
 }
 
@@ -1390,7 +1465,8 @@ function recomputeTurfStats(ctx: any, turfId: number) {
     }
   }
 
-  const existing = ctx.db.turfStats.turfId.find(turfId);
+  const turfStats = turfStatsAccessor(ctx);
+  const existing = turfStats.find(turfId);
   if (existing) {
     existing.total_voters = total;
     existing.not_contacted_count = notContacted;
@@ -1400,7 +1476,7 @@ function recomputeTurfStats(ctx: any, turfId: number) {
     existing.donated_count = donated;
     existing.active_volunteer_count = activeVolunteers;
     existing.update_count += 1;
-    ctx.db.turfStats.turfId.update(existing);
+    turfStats.update(existing);
   } else {
     ctx.db.turfStats.insert({
       turf_id: turfId,
@@ -1443,11 +1519,12 @@ function logActivity(
     created_at: ctx.timestamp,
   });
 
-  const stats = ctx.db.turfStats.turfId.find(event.turfId);
+  const turfStats = turfStatsAccessor(ctx);
+  const stats = turfStats.find(event.turfId);
   if (stats) {
     stats.last_event_at = ctx.timestamp;
     stats.update_count += 1;
-    ctx.db.turfStats.turfId.update(stats);
+    turfStats.update(stats);
   }
   pruneActivityEvents(ctx);
 }

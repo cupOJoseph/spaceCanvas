@@ -8,6 +8,7 @@ const TARGET_VOTERS_PER_TURF = intEnv('TARGET_VOTERS_PER_TURF', 200);
 const TURF_BATCH_SIZE = intEnv('TURF_BATCH_SIZE', 20);
 const VOTER_BATCH_SIZE = intEnv('VOTER_BATCH_SIZE', 1200);
 const MATERIALIZE_LIMIT = intEnv('MATERIALIZE_LIMIT', 0);
+const SKIP_DERIVED_CLEAR = process.env.SKIP_DERIVED_CLEAR === '1';
 const ARTIFACT_PATH =
   process.env.DERIVED_ARTIFACT_PATH ?? 'data/travis-derived-turfs.json';
 const CSV_PATH =
@@ -131,8 +132,12 @@ async function importArtifact() {
 }
 
 async function importRows({ turfs, voters }) {
-  console.log('Clearing derived realtime tables');
-  await connection.reducers.clearDerivedData();
+  if (SKIP_DERIVED_CLEAR) {
+    console.log('Skipping derived table clear');
+  } else {
+    console.log('Clearing derived realtime tables');
+    await connection.reducers.clearDerivedData();
+  }
 
   let turfIndex = 0;
   let voterIndex = 0;
@@ -142,10 +147,12 @@ async function importRows({ turfs, voters }) {
     turfIndex += turfBatch.length;
     voterIndex += voterBatch.length;
     const finalBatch = turfIndex >= turfs.length && voterIndex >= voters.length;
-    await connection.reducers.importDerivedDataBatch({
+    await connection.reducers.importDerivedDataJsonBatch({
       finalBatch,
-      turfs: turfBatch,
-      voters: voterBatch,
+      payloadJson: JSON.stringify({
+        turfs: turfBatch,
+        voters: voterBatch,
+      }),
     });
     console.log(
       `Imported turfs=${turfIndex.toLocaleString()}/${turfs.length.toLocaleString()} households=${voterIndex.toLocaleString()}/${voters.length.toLocaleString()}`
