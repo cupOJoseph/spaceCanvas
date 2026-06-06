@@ -1,16 +1,20 @@
 import * as turf from '@turf/turf';
-import { createReadStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { dirname } from 'node:path';
 import { DbConnection, defaultDatabase, defaultHost } from './spacetime-client.mjs';
 
-const TARGET_VOTERS_PER_TURF = intEnv('TARGET_VOTERS_PER_TURF', 200);
+const TARGET_VOTERS_PER_TURF = intEnv('TARGET_VOTERS_PER_TURF', 100);
 const TURF_BATCH_SIZE = intEnv('TURF_BATCH_SIZE', 20);
 const VOTER_BATCH_SIZE = intEnv('VOTER_BATCH_SIZE', 1200);
 const MATERIALIZE_LIMIT = intEnv('MATERIALIZE_LIMIT', 0);
+const MAX_WALK_ROUTE_POINTS = intEnv('MAX_WALK_ROUTE_POINTS', 16);
+const MIN_BOUNDARY_PAD_DEGREES = numberEnv('MIN_BOUNDARY_PAD_DEGREES', 0.0007);
 const SKIP_DERIVED_CLEAR = process.env.SKIP_DERIVED_CLEAR === '1';
 const ARTIFACT_PATH =
   process.env.DERIVED_ARTIFACT_PATH ?? 'data/travis-derived-turfs.json';
+const GEOCODE_CACHE_PATH =
+  process.env.TRAVIS_GEOCODE_CACHE ?? 'data/travis-geocodes.jsonl';
 const CSV_PATH =
   process.env.TRAVIS_VOTER_CSV ??
   new URL('../../data/travis-county-Registered_Voter_List.csv', import.meta.url)
@@ -23,6 +27,12 @@ const mode = args.has('--export')
   : args.has('--import')
     ? 'import'
     : process.env.MATERIALIZE_MODE ?? 'export-import';
+const geocodeCache = mode === 'import' ? new Map() : loadGeocodeCache(GEOCODE_CACHE_PATH);
+const coordinateStats = {
+  explicit: 0,
+  geocoded: 0,
+  synthetic: 0,
+};
 const TRAVIS_CENTER = { lat: 30.2672, lng: -97.7431 };
 const TRAVIS_BOUNDS = {
   maxLat: 30.628,
@@ -109,6 +119,7 @@ async function exportArtifactFromCsv() {
   writeArtifact({
     meta: {
       createdAt: new Date().toISOString(),
+      coordinateSources: coordinateStats,
       sourceRows: households.reduce(
         (sum, row) => sum + row.registered_voter_count,
         0
@@ -251,54 +262,36 @@ function addRegisteredRowToHouseholds(households, row, parsed) {
 function finalizeHouseholds(households) {
   const sorted = [...households.values()].sort(compareHouseholds);
   let id = 1;
-  let turfId = 1;
-  let votersInTurf = 0;
   for (const household of sorted) {
-    if (
-      votersInTurf > 0 &&
-      votersInTurf + household.registered_voter_count > TARGET_VOTERS_PER_TURF
-    ) {
-      turfId += 1;
-      votersInTurf = 0;
-    }
     household.id = id;
-    household.turf_id = turfId;
+    household.turf_id = 0;
     household.household_name = householdName(household);
     delete household.names;
     delete household.city;
-    votersInTurf += household.registered_voter_count;
     id += 1;
   }
   return sorted;
 }
 
 function buildTurfs(households) {
-  const byTurf = new Map();
-  for (const household of households) {
-    const rows = byTurf.get(household.turf_id) ?? [];
-    rows.push(household);
-    byTurf.set(household.turf_id, rows);
-  }
-
-  return [...byTurf.entries()].map(([id, rows]) => {
+  const groups = spatiallyPartitionHouseholds(households);
+  return groups.map((rows, index) => {
+    const id = index + 1;
+    for (const row of rows) {
+      row.turf_id = id;
+    }
     const featureCollection = turf.featureCollection(
-      rows.map(row => turf.point([row.lng, row.lat]))
+      rows.map(row =>
+        turf.point([row.lng, row.lat], {
+          weight: row.registered_voter_count,
+        })
+      )
     );
-    const center = turf.center(featureCollection).geometry.coordinates;
-    const bbox = turf.bbox(featureCollection);
-    const expanded = expandBbox(bbox);
-    const boundary = [
-      { lat: expanded[1], lng: expanded[0] },
-      { lat: expanded[3], lng: expanded[0] },
-      { lat: expanded[3], lng: expanded[2] },
-      { lat: expanded[1], lng: expanded[2] },
-    ];
-    const walkRoute = rows
-      .slice()
-      .sort((a, b) => a.lat - b.lat || a.lng - b.lng)
-      .filter((_row, index) => index % Math.max(1, Math.floor(rows.length / 10)) === 0)
-      .slice(0, 12)
-      .map(row => ({ lat: row.lat, lng: row.lng }));
+    const center = turf.centerMean(featureCollection, {
+      weight: 'weight',
+    }).geometry.coordinates;
+    const boundary = turfBoundary(featureCollection, rows);
+    const walkRoute = walkingRoute(rows);
     const precincts = [...new Set(rows.map(row => row.precinct).filter(Boolean))].sort();
     return {
       boundary,
@@ -313,6 +306,179 @@ function buildTurfs(households) {
       walk_route: walkRoute.length > 0 ? walkRoute : [{ lat: center[1], lng: center[0] }],
     };
   });
+}
+
+function spatiallyPartitionHouseholds(households) {
+  return splitSpatialGroup(households).sort(compareTurfGroups);
+}
+
+function splitSpatialGroup(rows) {
+  const voterCount = totalRegisteredVoters(rows);
+  const desiredPieces = Math.ceil(voterCount / TARGET_VOTERS_PER_TURF);
+  if (rows.length <= 1 || desiredPieces <= 1) {
+    return [rows];
+  }
+
+  const axis = widerAxis(rows);
+  const sorted = rows.slice().sort((a, b) => compareByAxis(a, b, axis));
+  const leftPieces = Math.max(1, Math.floor(desiredPieces / 2));
+  const leftTarget = (voterCount * leftPieces) / desiredPieces;
+  const splitIndex = weightedSplitIndex(sorted, leftTarget);
+  const left = sorted.slice(0, splitIndex);
+  const right = sorted.slice(splitIndex);
+  if (left.length === 0 || right.length === 0) {
+    return [sorted];
+  }
+  return [...splitSpatialGroup(left), ...splitSpatialGroup(right)];
+}
+
+function totalRegisteredVoters(rows) {
+  return rows.reduce((sum, row) => sum + row.registered_voter_count, 0);
+}
+
+function widerAxis(rows) {
+  const bbox = bboxForRows(rows);
+  const westEastKm = turf.distance([bbox.minLng, bbox.minLat], [bbox.maxLng, bbox.minLat], {
+    units: 'kilometers',
+  });
+  const southNorthKm = turf.distance([bbox.minLng, bbox.minLat], [bbox.minLng, bbox.maxLat], {
+    units: 'kilometers',
+  });
+  return westEastKm >= southNorthKm ? 'lng' : 'lat';
+}
+
+function bboxForRows(rows) {
+  let maxLat = -Infinity;
+  let maxLng = -Infinity;
+  let minLat = Infinity;
+  let minLng = Infinity;
+  for (const row of rows) {
+    maxLat = Math.max(maxLat, row.lat);
+    maxLng = Math.max(maxLng, row.lng);
+    minLat = Math.min(minLat, row.lat);
+    minLng = Math.min(minLng, row.lng);
+  }
+  return { maxLat, maxLng, minLat, minLng };
+}
+
+function compareByAxis(a, b, axis) {
+  if (axis === 'lng') {
+    return (
+      a.lng - b.lng ||
+      a.lat - b.lat ||
+      a.precinct.localeCompare(b.precinct) ||
+      a.household_key.localeCompare(b.household_key)
+    );
+  }
+  return (
+    a.lat - b.lat ||
+    a.lng - b.lng ||
+    a.precinct.localeCompare(b.precinct) ||
+    a.household_key.localeCompare(b.household_key)
+  );
+}
+
+function weightedSplitIndex(rows, target) {
+  let running = 0;
+  for (let index = 0; index < rows.length - 1; index += 1) {
+    const before = running;
+    running += rows[index].registered_voter_count;
+    if (running >= target) {
+      const splitBefore = Math.max(1, index);
+      const splitAfter = Math.min(rows.length - 1, index + 1);
+      return Math.abs(before - target) < Math.abs(running - target)
+        ? splitBefore
+        : splitAfter;
+    }
+  }
+  return Math.max(1, Math.min(rows.length - 1, Math.floor(rows.length / 2)));
+}
+
+function compareTurfGroups(a, b) {
+  const centerA = weightedCenter(a);
+  const centerB = weightedCenter(b);
+  return centerA.lat - centerB.lat || centerA.lng - centerB.lng;
+}
+
+function weightedCenter(rows) {
+  const total = totalRegisteredVoters(rows);
+  if (total <= 0) {
+    return rows[0] ?? TRAVIS_CENTER;
+  }
+  return rows.reduce(
+    (center, row) => ({
+      lat: center.lat + (row.lat * row.registered_voter_count) / total,
+      lng: center.lng + (row.lng * row.registered_voter_count) / total,
+    }),
+    { lat: 0, lng: 0 }
+  );
+}
+
+function turfBoundary(featureCollection, rows) {
+  const uniquePoints = new Set(rows.map(row => `${row.lat.toFixed(7)},${row.lng.toFixed(7)}`));
+  if (uniquePoints.size >= 3) {
+    const hull = turf.convex(featureCollection);
+    const boundary = polygonBoundary(hull);
+    if (boundary.length >= 3) {
+      return boundary;
+    }
+  }
+  return bboxBoundary(turf.bbox(featureCollection));
+}
+
+function polygonBoundary(feature) {
+  const ring = feature?.geometry?.coordinates?.[0];
+  if (!Array.isArray(ring)) {
+    return [];
+  }
+  const openRing = ring.length > 1 ? ring.slice(0, -1) : ring;
+  return openRing.map(([lng, lat]) => ({
+    lat: clamp(lat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
+    lng: clamp(lng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
+  }));
+}
+
+function bboxBoundary(bbox) {
+  const expanded = expandBbox(bbox);
+  return [
+    { lat: expanded[1], lng: expanded[0] },
+    { lat: expanded[3], lng: expanded[0] },
+    { lat: expanded[3], lng: expanded[2] },
+    { lat: expanded[1], lng: expanded[2] },
+  ];
+}
+
+function walkingRoute(rows) {
+  const remaining = rows.slice();
+  const route = [];
+  let current =
+    remaining.find(row => row.lng === Math.min(...remaining.map(item => item.lng))) ??
+    remaining[0];
+  while (current && route.length < MAX_WALK_ROUTE_POINTS) {
+    route.push({ lat: current.lat, lng: current.lng });
+    remaining.splice(remaining.indexOf(current), 1);
+    current = nearestRow(current, remaining);
+  }
+  return route;
+}
+
+function nearestRow(origin, rows) {
+  let nearest;
+  let bestDistance = Infinity;
+  for (const row of rows) {
+    const distance = approximateDistanceSquared(origin, row);
+    if (distance < bestDistance) {
+      nearest = row;
+      bestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function approximateDistanceSquared(a, b) {
+  const latDelta = b.lat - a.lat;
+  const lngDelta = (b.lng - a.lng) * Math.cos(((a.lat + b.lat) / 2) * (Math.PI / 180));
+  return latDelta * latDelta + lngDelta * lngDelta;
 }
 
 function parsePayload(payload) {
@@ -391,8 +557,15 @@ function coordinateFor(row, parsed, key) {
     parsed.Longitude ?? parsed.longitude ?? parsed.lng ?? parsed.LNG ?? parsed.X
   );
   if (lat && lng && insideBounds({ lat, lng })) {
+    coordinateStats.explicit += 1;
     return { lat, lng };
   }
+  const cached = geocodeCache.get(key);
+  if (cached?.accepted && insideBounds(cached)) {
+    coordinateStats.geocoded += 1;
+    return { lat: cached.lat, lng: cached.lng };
+  }
+  coordinateStats.synthetic += 1;
   const cityKey = cleanUpper(row.city || parsed.City || 'AUSTIN').replaceAll(' ', '_');
   const center = CITY_CENTERS[cityKey] ?? zipCenter(row.zip5 || parsed['Zip Code 5']);
   const hash = hashString(key);
@@ -423,8 +596,8 @@ function zipCenter(zip5) {
 }
 
 function expandBbox(bbox) {
-  const padLng = Math.max(0.0025, (bbox[2] - bbox[0]) * 0.22);
-  const padLat = Math.max(0.0025, (bbox[3] - bbox[1]) * 0.22);
+  const padLng = Math.max(MIN_BOUNDARY_PAD_DEGREES, (bbox[2] - bbox[0]) * 0.22);
+  const padLat = Math.max(MIN_BOUNDARY_PAD_DEGREES, (bbox[3] - bbox[1]) * 0.22);
   return [
     clamp(bbox[0] - padLng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
     clamp(bbox[1] - padLat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
@@ -467,6 +640,28 @@ function cleanUpper(value) {
   return clean(value).toUpperCase();
 }
 
+function loadGeocodeCache(filePath) {
+  const cache = new Map();
+  if (!existsSync(filePath)) {
+    return cache;
+  }
+  for (const line of readFileSync(filePath, 'utf8').split('\n')) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(line);
+      if (record.household_key) {
+        cache.set(record.household_key, record);
+      }
+    } catch {
+      // Ignore partial cache lines so interrupted geocoding runs can resume.
+    }
+  }
+  console.log(`Loaded ${cache.size.toLocaleString()} cached Travis geocodes from ${filePath}`);
+  return cache;
+}
+
 function numberValue(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
@@ -497,6 +692,11 @@ function clamp(value, min, max) {
 function intEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function numberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function disconnect() {

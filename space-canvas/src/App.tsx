@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Map as MapboxMap } from 'mapbox-gl';
 import 'mapbox-gl/dist/mapbox-gl.css';
+import { Timestamp } from 'spacetimedb';
 import { useReducer, useSpacetimeDB, useTable } from 'spacetimedb/react';
 import { reducers, tables } from './module_bindings';
 import type {
   ActivityEvent,
-  SimState,
   Turf,
   TurfStats,
   Volunteer,
@@ -27,6 +27,7 @@ const STATUS_OPTIONS = [
 ] as const;
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN ?? '';
+const ANDROID_APK_DOWNLOAD_PATH = '/downloads/space-canvas-fieldops-debug.apk';
 
 const STATUS_META: Record<
   string,
@@ -66,6 +67,112 @@ const STATUS_META: Record<
 
 type View = 'dashboard' | 'mobile' | 'simulator';
 
+type TimeValue = Timestamp;
+
+type MapVolunteer = Pick<
+  Volunteer,
+  | 'active'
+  | 'completedCount'
+  | 'currentTurfId'
+  | 'displayName'
+  | 'heading'
+  | 'id'
+  | 'isSimulated'
+  | 'lat'
+  | 'lng'
+  | 'targetVoterId'
+> & {
+  updatedAt?: TimeValue;
+};
+
+type LocalVoterPatch = {
+  attemptCount: number;
+  donationCents: number;
+  lastContactedAt: TimeValue;
+  lastContactedBy: number;
+  status: string;
+  updatedSeq: number;
+};
+
+type LocalSimulationSnapshot = {
+  active: boolean;
+  completed: boolean;
+  events: ActivityEvent[];
+  startedAt: number | null;
+  ticks: number;
+  totalVolunteerMs: number;
+  voterPatches: Record<number, LocalVoterPatch>;
+  volunteers: MapVolunteer[];
+};
+
+type RuntimeVolunteer = MapVolunteer & {
+  fromLat: number;
+  fromLng: number;
+  nextKnockAt: number;
+  targetAddress: string;
+  targetDurationMs: number;
+  targetHouseholdName: string;
+  toLat: number;
+  toLng: number;
+  travelStartedAt: number;
+};
+
+type LocalSimulationRuntime = {
+  eventSeq: number;
+  events: ActivityEvent[];
+  tickTimer: number;
+  ticks: number;
+  totalCompletedVolunteerMs: number;
+  turfQueues: Map<number, Voter[]>;
+  voterPatches: Record<number, LocalVoterPatch>;
+  voterSeq: number;
+  volunteers: RuntimeVolunteer[];
+};
+
+const LOCAL_SIM_VOLUNTEER_COUNT = 5000;
+const LOCAL_SIM_TICK_MS = 250;
+const LOCAL_SIM_FLUSH_MS = 450;
+const LOCAL_SIM_MIN_KNOCK_MS = 5000;
+const LOCAL_SIM_MAX_KNOCK_MS = 120000;
+const LOCAL_SIM_FEED_LIMIT = 48;
+const LOCAL_SIM_RENDERED_VOLUNTEER_LIMIT = 5000;
+const FIRST_NAMES = [
+  'Joe',
+  'Marie',
+  'Alex',
+  'Nina',
+  'Sam',
+  'Taylor',
+  'Jordan',
+  'Riley',
+  'Casey',
+  'Morgan',
+  'Avery',
+  'Drew',
+  'Maya',
+  'Owen',
+  'Priya',
+  'Luis',
+];
+const LAST_NAMES = [
+  'Schmoe',
+  'Sue',
+  'Rivera',
+  'Patel',
+  'Johnson',
+  'Garcia',
+  'Nguyen',
+  'Brown',
+  'Martinez',
+  'Lee',
+  'Walker',
+  'Young',
+  'King',
+  'Flores',
+  'Hall',
+  'Allen',
+];
+
 function App() {
   const [view, setView] = useHashView();
   const { isActive: connected, identity, connectionError } = useSpacetimeDB();
@@ -73,16 +180,14 @@ function App() {
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [subscriptionWaitMs, setSubscriptionWaitMs] = useState(0);
-  const [selectedTurfId, setSelectedTurfId] = useState(1);
+  const [selectedTurfId, setSelectedTurfId] = useState(2);
 
   const [turfs, turfsReady] = useTable(tables.turf);
-  const [voters, votersReady] = useTable(
-    tables.voter.where(row => row.turfId.eq(selectedTurfId))
-  );
+  const [voters, votersReady] = useTable(tables.voter);
   const [volunteers, volunteersReady] = useTable(tables.volunteer);
   const [events, eventsReady] = useTable(tables.activityEvent);
   const [stats, statsReady] = useTable(tables.turfStats);
-  const [simStates, simReady] = useTable(tables.simState);
+  const [, simReady] = useTable(tables.simState);
 
   const ready =
     turfsReady &&
@@ -113,14 +218,51 @@ function App() {
     return () => window.clearInterval(timer);
   }, [connected, ready]);
 
+  const reportActionError = useCallback((label: string, error: unknown) => {
+    setActionError(`${label} failed: ${formatError(error)}`);
+  }, []);
+
   const resetDemoData = useReducer(reducers.resetDemoData);
   const claimTurf = useReducer(reducers.claimTurf);
   const updateVoterStatus = useReducer(reducers.updateVoterStatus);
   const updateVolunteerLocation = useReducer(reducers.updateVolunteerLocation);
   const completeTurf = useReducer(reducers.completeTurf);
-  const seedSimulation = useReducer(reducers.seedSimulation);
-  const stopSimulation = useReducer(reducers.stopSimulation);
-  const simulateTick = useReducer(reducers.simulateTick);
+  const localSimulation = useLocalSimulation(turfs, voters, reportActionError);
+
+  const displayedVoters = useMemo(
+    () => applyLocalVoterPatches(voters, localSimulation.snapshot.voterPatches),
+    [localSimulation.snapshot.voterPatches, voters]
+  );
+  const displayedVolunteers = useMemo(
+    () =>
+      localSimulation.snapshot.events.length > 0
+        ? [
+            ...volunteers.filter(volunteer => !volunteer.isSimulated),
+            ...localSimulation.snapshot.volunteers,
+          ]
+        : volunteers,
+    [localSimulation.snapshot.events.length, localSimulation.snapshot.volunteers, volunteers]
+  );
+  const displayedStats = useMemo(
+    () =>
+      localSimulation.snapshot.events.length > 0
+        ? buildStatsFromVoters(turfs, displayedVoters, displayedVolunteers)
+        : stats,
+    [
+      displayedVolunteers,
+      displayedVoters,
+      localSimulation.snapshot.events.length,
+      stats,
+      turfs,
+    ]
+  );
+  const displayedEvents = useMemo(
+    () =>
+      localSimulation.snapshot.events.length > 0
+        ? localSimulation.snapshot.events
+        : events,
+    [events, localSimulation.snapshot.events]
+  );
 
   useEffect(() => {
     if (
@@ -167,12 +309,9 @@ function App() {
   );
 
   const selectedStats = useMemo(
-    () => stats.find(row => row.turfId === selectedTurf?.id),
-    [selectedTurf, stats]
+    () => displayedStats.find(row => row.turfId === selectedTurf?.id),
+    [displayedStats, selectedTurf]
   );
-  const reportActionError = useCallback((label: string, error: unknown) => {
-    setActionError(`${label} failed: ${formatError(error)}`);
-  }, []);
 
   return (
     <div className="app-shell">
@@ -239,7 +378,7 @@ function App() {
         <Dashboard
           completeTurf={completeTurf}
           currentVolunteer={currentVolunteer}
-          events={events}
+          events={displayedEvents}
           onActionError={reportActionError}
           ready={ready}
           resetDemoData={resetDemoData}
@@ -247,12 +386,12 @@ function App() {
           selectedTurf={selectedTurf}
           selectedTurfId={selectedTurfId}
           setSelectedTurfId={setSelectedTurfId}
-          stats={stats}
+          stats={displayedStats}
           turfs={turfs}
           updateVolunteerLocation={updateVolunteerLocation}
           updateVoterStatus={updateVoterStatus}
-          voters={voters}
-          volunteers={volunteers}
+          voters={displayedVoters}
+          volunteers={displayedVolunteers}
         />
       )}
 
@@ -273,14 +412,19 @@ function App() {
       {view === 'simulator' && (
         <SimulatorPanel
           connected={connected}
-          events={events}
+          events={displayedEvents}
+          localSimulation={localSimulation.snapshot}
           onActionError={reportActionError}
-          seedSimulation={seedSimulation}
-          simState={simStates[0]}
-          simulateTick={simulateTick}
-          stats={stats}
-          stopSimulation={stopSimulation}
-          volunteers={volunteers}
+          selectedTurfId={selectedTurfId}
+          setSelectedTurfId={setSelectedTurfId}
+          startLocalSimulation={localSimulation.start}
+          stats={displayedStats}
+          stopLocalSimulation={localSimulation.stop}
+          turfs={turfs}
+          updateVolunteerLocation={updateVolunteerLocation}
+          updateVoterStatus={updateVoterStatus}
+          voters={displayedVoters}
+          volunteers={displayedVolunteers}
         />
       )}
     </div>
@@ -332,7 +476,7 @@ function Dashboard({
     donationCents: number;
   }) => Promise<void>;
   voters: readonly Voter[];
-  volunteers: readonly Volunteer[];
+  volunteers: readonly MapVolunteer[];
 }) {
   const totals = useMemo(() => summarizeStats(stats), [stats]);
   const liveTelemetry = useMemo(
@@ -346,10 +490,11 @@ function Dashboard({
   const recentVoterUpdates = useMemo(
     () =>
       voters
+        .filter(voter => voter.turfId === selectedTurfId)
         .filter(voter => voter.updatedSeq > 0)
         .sort((a, b) => b.updatedSeq - a.updatedSeq)
         .slice(0, 14),
-    [voters]
+    [selectedTurfId, voters]
   );
 
   return (
@@ -590,14 +735,25 @@ function TravisMap({
     donationCents: number;
   }) => Promise<void>;
   voters: readonly Voter[];
-  volunteers: readonly Volunteer[];
+  volunteers: readonly MapVolunteer[];
 }) {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapboxMap | null>(null);
   const [mapSize, setMapSize] = useState({ width: 1000, height: 720 });
   const [mapFrame, setMapFrame] = useState(0);
   const [mapError, setMapError] = useState<string | null>(null);
-  const bounds = useMemo(() => getBounds(turfs), [turfs]);
+  const selectedTurf = useMemo(
+    () => turfs.find(turf => turf.id === selectedTurfId),
+    [selectedTurfId, turfs]
+  );
+  const mapTurfs = useMemo(
+    () => (selectedTurf ? [selectedTurf] : []),
+    [selectedTurf]
+  );
+  const bounds = useMemo(
+    () => getBounds(mapTurfs.length > 0 ? mapTurfs : turfs),
+    [mapTurfs, turfs]
+  );
   const selectedVoters = voters.filter(voter => voter.turfId === selectedTurfId);
   const activeVolunteers = volunteers.filter(
     volunteer => volunteer.active && volunteer.currentTurfId === selectedTurfId
@@ -812,7 +968,7 @@ function TravisMap({
           ))}
         </g>
 
-        {turfs.map(turf => {
+        {mapTurfs.map(turf => {
           const points = turf.boundary
             .map(point => project(point.lat, point.lng).join(','))
             .join(' ');
@@ -826,9 +982,7 @@ function TravisMap({
           return (
             <g key={turf.id}>
               <polygon
-                className={`turf-polygon ${
-                  turf.id === selectedTurfId ? 'selected' : ''
-                }`}
+                className="turf-polygon selected"
                 points={points}
                 onClick={() => setSelectedTurfId(turf.id)}
               />
@@ -848,7 +1002,7 @@ function TravisMap({
               className="voter-point"
               cx={x}
               cy={y}
-              fill={statusMeta(voter.status).color}
+              fill={mapVoterColor(voter)}
               onClick={() => handleVoterClick(voter)}
               r={voter.status === STATUS_NOT_CONTACTED ? 4 : 5.8}
             >
@@ -877,17 +1031,19 @@ function TravisMap({
           );
         })}
       </svg>
-      <button
-        className="map-nudge"
-        onClick={() => {
-          const turf = turfs.find(row => row.id === selectedTurfId);
-          if (turf) {
-            handleMapClick(turf.centerLat, turf.centerLng);
-          }
-        }}
-      >
-        Pin me to selected turf
-      </button>
+      {currentVolunteer && (
+        <button
+          className="map-nudge"
+          onClick={() => {
+            const turf = turfs.find(row => row.id === selectedTurfId);
+            if (turf) {
+              handleMapClick(turf.centerLat, turf.centerLng);
+            }
+          }}
+        >
+          Pin me to selected turf
+        </button>
+      )}
     </div>
   );
 }
@@ -1048,6 +1204,13 @@ function MobileFieldApp({
 
   return (
     <main className="mobile-layout">
+      <a
+        className="apk-download apk-download-standalone"
+        download
+        href={ANDROID_APK_DOWNLOAD_PATH}
+      >
+        download android app
+      </a>
       <section className="phone-shell">
         <div className="phone-top">
           <span>{connected ? 'Live sync' : 'Offline'}</span>
@@ -1183,65 +1346,55 @@ function MobileFieldApp({
 function SimulatorPanel({
   connected,
   events,
+  localSimulation,
   onActionError,
-  seedSimulation,
-  simState,
-  simulateTick,
+  selectedTurfId,
+  setSelectedTurfId,
+  startLocalSimulation,
   stats,
-  stopSimulation,
+  stopLocalSimulation,
+  turfs,
+  updateVolunteerLocation,
+  updateVoterStatus,
+  voters,
   volunteers,
 }: {
   connected: boolean;
   events: readonly ActivityEvent[];
+  localSimulation: LocalSimulationSnapshot;
   onActionError: (label: string, error: unknown) => void;
-  seedSimulation: (params: { volunteerCount: number }) => Promise<void>;
-  simState: SimState | undefined;
-  simulateTick: (params: { batchSize: number }) => Promise<void>;
+  selectedTurfId: number;
+  setSelectedTurfId: (id: number) => void;
+  startLocalSimulation: () => void;
   stats: readonly TurfStats[];
-  stopSimulation: () => Promise<void>;
-  volunteers: readonly Volunteer[];
+  stopLocalSimulation: () => void;
+  turfs: readonly Turf[];
+  updateVolunteerLocation: (params: {
+    volunteerId: number;
+    lat: number;
+    lng: number;
+    heading: number;
+  }) => Promise<void>;
+  updateVoterStatus: (params: {
+    voterId: number;
+    status: string;
+    volunteerId: number;
+    lat: number;
+    lng: number;
+    donationCents: number;
+  }) => Promise<void>;
+  voters: readonly Voter[];
+  volunteers: readonly MapVolunteer[];
 }) {
-  const volunteerCount = 10000;
-  const batchSize = 800;
-  const [running, setRunning] = useState(false);
-  const inFlight = useRef(false);
-
-  useEffect(() => {
-    if (!running || !connected) {
-      return;
-    }
-    let cancelled = false;
-    let timer: number | undefined;
-    const loop = () => {
-      if (cancelled) {
-        return;
-      }
-      if (!inFlight.current) {
-        inFlight.current = true;
-        void simulateTick({ batchSize })
-          .catch(error => {
-            setRunning(false);
-            onActionError('Simulation tick', error);
-          })
-          .finally(() => {
-            inFlight.current = false;
-          });
-      }
-      timer = window.setTimeout(loop, 420);
-    };
-    loop();
-    return () => {
-      cancelled = true;
-      if (timer) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [batchSize, connected, onActionError, running, simulateTick]);
-
   const simulatedCount = volunteers.filter(volunteer => volunteer.isSimulated).length;
   const touched = summarizeStats(stats).touched;
   const outcomeRows = useMemo(() => buildOutcomeRowsFromStats(stats), [stats]);
-  const recentEvents = [...events].sort((a, b) => b.id - a.id).slice(0, 16);
+  const turfProgressRows = useMemo(() => buildTurfProgressRows(stats), [stats]);
+  const recentEvents = [...events]
+    .sort((a, b) => b.id - a.id)
+    .slice(0, LOCAL_SIM_FEED_LIMIT);
+  const totalVoters = voters.length;
+  const canSimulate = turfs.length > 0 && totalVoters > 0;
 
   return (
     <main className="sim-layout">
@@ -1251,39 +1404,69 @@ function SimulatorPanel({
             <p className="eyebrow">Stress simulator</p>
             <h2>One-button Travis County simulation</h2>
           </div>
-          <div className="sim-state" data-running={running}>
-            {running ? 'Running' : 'Stopped'}
+          <div className="sim-state" data-running={localSimulation.active}>
+            {localSimulation.active
+              ? 'Running'
+              : localSimulation.completed
+                ? 'Complete'
+                : 'Stopped'}
           </div>
         </div>
 
         <div className="sim-buttons single">
           <button
             className="simulate-primary"
-            disabled={!connected}
+            disabled={!canSimulate}
             onClick={() => {
-              if (running) {
-                setRunning(false);
-                void stopSimulation().catch(error =>
-                  onActionError('Stop simulation', error)
-                );
+              if (localSimulation.active) {
+                stopLocalSimulation();
                 return;
               }
-              void seedSimulation({ volunteerCount })
-                .then(() => setRunning(true))
-                .catch(error => onActionError('Simulate', error));
+              try {
+                startLocalSimulation();
+              } catch (error) {
+                onActionError('Simulate', error);
+              }
             }}
           >
-            {running ? 'Stop simulation' : 'Simulate'}
+            {localSimulation.active ? 'Stop simulation' : 'Simulate'}
           </button>
-          <span>10,000 canvassers · 800 reducers per tick · live GPS and status writes</span>
+          <span>
+            {LOCAL_SIM_VOLUNTEER_COUNT.toLocaleString()} local volunteers · 5s
+            to 2m per knock · 85/10/4/1 outcome mix
+            {!connected ? ' · waiting on local subscribed data' : ''}
+          </span>
         </div>
 
         <div className="metric-row">
           <Metric label="Simulated" value={simulatedCount} />
           <Metric label="Knocked voters" value={touched} accent="strong" />
-          <Metric label="Ticks" value={simState?.ticks ?? 0} />
-          <Metric label="Events" value={simState?.eventsEmitted ?? 0} />
+          <Metric
+            label="Volunteer time"
+            value={formatVolunteerTime(localSimulation.totalVolunteerMs)}
+          />
+          <Metric label="Events" value={recentEvents.length} />
         </div>
+
+        <section className="sim-map-panel">
+          <div className="section-header compact">
+            <div>
+              <p className="eyebrow">Volunteer GPS</p>
+              <h3>Live simulation map</h3>
+            </div>
+          </div>
+          <TravisMap
+            currentVolunteer={undefined}
+            onActionError={onActionError}
+            selectedTurfId={selectedTurfId}
+            setSelectedTurfId={setSelectedTurfId}
+            turfs={turfs}
+            updateVolunteerLocation={updateVolunteerLocation}
+            updateVoterStatus={updateVoterStatus}
+            voters={voters}
+            volunteers={volunteers}
+          />
+        </section>
 
         <div className="outcome-panel">
           <div>
@@ -1300,7 +1483,6 @@ function SimulatorPanel({
                   >
                     {row.label}
                   </span>
-                  <em>{row.targetLabel}</em>
                 </div>
                 <strong>{row.count.toLocaleString()}</strong>
                 <div className="bar-track">
@@ -1318,14 +1500,17 @@ function SimulatorPanel({
         </div>
 
         <div className="distribution">
-          {stats.map(row => (
-            <div key={row.turfId}>
+          {turfProgressRows.map(row => (
+            <div
+              className={row.completed ? 'complete' : ''}
+              key={row.turfId}
+            >
               <span>Turf {row.turfId}</span>
-              <strong>{row.activeVolunteerCount}</strong>
+              <strong>{row.percent}%</strong>
               <div>
                 <span
                   style={{
-                    width: `${Math.min(100, row.activeVolunteerCount / 14)}%`,
+                    width: `${row.percent}%`,
                   }}
                 />
               </div>
@@ -1337,24 +1522,513 @@ function SimulatorPanel({
       <aside className="sim-feed">
         <div className="section-header compact">
           <div>
-            <p className="eyebrow">Latest simulated reducer output</p>
-            <h2>Live stream</h2>
+            <p className="eyebrow">Local knocks</p>
+            <h2>Activity feed</h2>
           </div>
         </div>
-        {recentEvents.map(event => (
-          <div className="event-row" key={event.id}>
-            <span className={`event-type ${statusMeta(event.status).tone}`}>
-              {statusMeta(event.status).short}
-            </span>
-            <div>
-              <strong>{event.message}</strong>
-              <span>{relativeTime(event.createdAt)}</span>
+        <div className="event-feed local-feed">
+          {recentEvents.length === 0 ? (
+            <p className="empty-state">
+              Press Simulate to start local knock events.
+            </p>
+          ) : (
+            recentEvents.map(event => (
+              <div className="event-row" key={event.id}>
+                <span className={`event-type ${statusMeta(event.status).tone}`}>
+                  {statusMeta(event.status).short}
+                </span>
+                <div>
+                  <strong>{event.message}</strong>
+                  <span>{relativeTime(event.createdAt)}</span>
+                </div>
+              </div>
+            ))
+          )}
+          {localSimulation.completed && (
+            <div className="event-row sim-complete-row">
+              <span className="event-type green">OK</span>
+              <div>
+                <strong>All available turf queues are complete.</strong>
+                <span>local simulation stopped</span>
+              </div>
             </div>
-          </div>
-        ))}
+          )}
+        </div>
       </aside>
     </main>
   );
+}
+
+function useLocalSimulation(
+  turfs: readonly Turf[],
+  voters: readonly Voter[],
+  onActionError: (label: string, error: unknown) => void
+) {
+  const runtimeRef = useRef<LocalSimulationRuntime | null>(null);
+  const flushTimerRef = useRef<number | null>(null);
+  const [snapshot, setSnapshot] = useState<LocalSimulationSnapshot>({
+    active: false,
+    completed: false,
+    events: [],
+    startedAt: null,
+    ticks: 0,
+    totalVolunteerMs: 0,
+    voterPatches: {},
+    volunteers: [],
+  });
+
+  const stop = useCallback(() => {
+    const runtime = runtimeRef.current;
+    if (runtime) {
+      window.clearInterval(runtime.tickTimer);
+      runtimeRef.current = null;
+    }
+    if (flushTimerRef.current) {
+      window.clearInterval(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    setSnapshot(current => ({
+      ...current,
+      active: false,
+      volunteers: current.volunteers.map(volunteer => ({
+        ...volunteer,
+        active: false,
+      })),
+    }));
+  }, []);
+
+  const flush = useCallback((completed = false) => {
+    const runtime = runtimeRef.current;
+    if (!runtime) {
+      return;
+    }
+    setSnapshot(current => ({
+      active: true,
+      completed,
+      events: runtime.events.slice(0, LOCAL_SIM_FEED_LIMIT),
+      startedAt: current.startedAt ?? Date.now(),
+      ticks: runtime.ticks,
+      totalVolunteerMs: totalVolunteerTime(runtime, Date.now()),
+      voterPatches: { ...runtime.voterPatches },
+      volunteers: runtime.volunteers
+        .slice(0, LOCAL_SIM_RENDERED_VOLUNTEER_LIMIT)
+        .map(volunteer => toMapVolunteer(volunteer, Date.now())),
+    }));
+  }, []);
+
+  const finish = useCallback(() => {
+    const runtime = runtimeRef.current;
+    if (!runtime) {
+      return;
+    }
+    window.clearInterval(runtime.tickTimer);
+    runtimeRef.current = null;
+    if (flushTimerRef.current) {
+      window.clearInterval(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    const finishedVolunteers = runtime.volunteers.map(volunteer => ({
+      ...toMapVolunteer(volunteer, Date.now()),
+      active: false,
+    }));
+    setSnapshot(current => ({
+      active: false,
+      completed: true,
+      events: runtime.events.slice(0, LOCAL_SIM_FEED_LIMIT),
+      startedAt: current.startedAt,
+      ticks: runtime.ticks,
+      totalVolunteerMs: totalVolunteerTime(runtime, Date.now()),
+      voterPatches: { ...runtime.voterPatches },
+      volunteers: finishedVolunteers,
+    }));
+  }, []);
+
+  const start = useCallback(() => {
+    stop();
+
+    const availableTurfs = turfs.filter(turf =>
+      voters.some(voter => voter.turfId === turf.id)
+    );
+    if (availableTurfs.length === 0 || voters.length === 0) {
+      throw new Error('No subscribed turfs or voters are ready yet');
+    }
+
+    const now = Date.now();
+    const turfQueues = new Map<number, Voter[]>();
+    for (const turf of availableTurfs) {
+      const queue = shuffle(
+        voters.filter(
+          voter =>
+            voter.turfId === turf.id && voter.status === STATUS_NOT_CONTACTED
+        )
+      );
+      if (queue.length > 0) {
+        turfQueues.set(turf.id, queue);
+      }
+    }
+
+    if (turfQueues.size === 0) {
+      throw new Error('All subscribed voters are already knocked');
+    }
+
+    const volunteers = Array.from(
+      { length: LOCAL_SIM_VOLUNTEER_COUNT },
+      (_item, index) => {
+        const turf = randomItem(availableTurfs);
+        const routePoint = randomItem(turf.walkRoute) ?? {
+          lat: turf.centerLat,
+          lng: turf.centerLng,
+        };
+        const volunteer: RuntimeVolunteer = {
+          active: true,
+          completedCount: 0,
+          currentTurfId: turf.id,
+          displayName: randomVolunteerName(index),
+          fromLat: routePoint.lat,
+          fromLng: routePoint.lng,
+          heading: randomHeading(),
+          id: 1_000_000 + index,
+          isSimulated: true,
+          lat: routePoint.lat,
+          lng: routePoint.lng,
+          nextKnockAt: now + randomKnockDelay(),
+          targetAddress: '',
+          targetDurationMs: 0,
+          targetHouseholdName: '',
+          targetVoterId: 0,
+          toLat: routePoint.lat,
+          toLng: routePoint.lng,
+          travelStartedAt: now,
+          updatedAt: localTimestamp(now),
+        };
+        assignNextLocalTarget(volunteer, turfQueues, availableTurfs, now);
+        return volunteer;
+      }
+    );
+
+    const runtime: LocalSimulationRuntime = {
+      eventSeq: 1,
+      events: [],
+      tickTimer: 0,
+      ticks: 0,
+      totalCompletedVolunteerMs: 0,
+      turfQueues,
+      voterPatches: {},
+      voterSeq: Math.max(1, ...voters.map(voter => voter.updatedSeq)) + 1,
+      volunteers,
+    };
+
+    const runTick = () => {
+      try {
+        const active = runLocalSimulationTick(runtime, availableTurfs);
+        flush(!active);
+        if (!active) {
+          finish();
+        }
+      } catch (error) {
+        stop();
+        onActionError('Local simulation tick', error);
+      }
+    };
+
+    runtime.tickTimer = window.setInterval(
+      runTick,
+      LOCAL_SIM_TICK_MS
+    );
+    runtimeRef.current = runtime;
+    flushTimerRef.current = window.setInterval(
+      () => flush(false),
+      LOCAL_SIM_FLUSH_MS
+    );
+    setSnapshot({
+      active: true,
+      completed: false,
+      events: [],
+      startedAt: now,
+      ticks: 0,
+      totalVolunteerMs: 0,
+      voterPatches: {},
+      volunteers: volunteers
+        .slice(0, LOCAL_SIM_RENDERED_VOLUNTEER_LIMIT)
+        .map(volunteer => toMapVolunteer(volunteer, now)),
+    });
+  }, [finish, flush, onActionError, stop, turfs, voters]);
+
+  useEffect(() => stop, [stop]);
+
+  return { snapshot, start, stop };
+}
+
+function runLocalSimulationTick(
+  runtime: LocalSimulationRuntime,
+  turfs: readonly Turf[]
+) {
+  const now = Date.now();
+  runtime.ticks += 1;
+  let activeVolunteers = 0;
+
+  for (const volunteer of runtime.volunteers) {
+    if (!volunteer.active) {
+      continue;
+    }
+    activeVolunteers += 1;
+    const position = interpolatedPosition(volunteer, now);
+    volunteer.lat = position.lat;
+    volunteer.lng = position.lng;
+
+    if (now < volunteer.nextKnockAt || volunteer.targetVoterId === 0) {
+      continue;
+    }
+
+    const status = randomKnockStatus();
+    const donationCents = status === STATUS_DONATED ? 5000 : 0;
+    runtime.voterPatches[volunteer.targetVoterId] = {
+      attemptCount: 1,
+      donationCents,
+      lastContactedAt: localTimestamp(now),
+      lastContactedBy: volunteer.id,
+      status,
+      updatedSeq: runtime.voterSeq,
+    };
+    runtime.totalCompletedVolunteerMs += volunteer.targetDurationMs;
+    runtime.voterSeq += 1;
+    volunteer.completedCount += 1;
+    volunteer.lat = volunteer.toLat;
+    volunteer.lng = volunteer.toLng;
+    volunteer.updatedAt = localTimestamp(now);
+
+    runtime.events.unshift({
+      createdAt: localTimestamp(now),
+      eventType: 'local_knock',
+      id: runtime.eventSeq,
+      lat: volunteer.lat,
+      lng: volunteer.lng,
+      message: `${volunteer.displayName} knocked ${volunteer.targetAddress}. ${
+        volunteer.targetHouseholdName
+      } updated: ${knockFeedLabel(status)}`,
+      status,
+      turfId: volunteer.currentTurfId,
+      voterId: volunteer.targetVoterId,
+      volunteerId: volunteer.id,
+    });
+    runtime.eventSeq += 1;
+    runtime.events = runtime.events.slice(0, LOCAL_SIM_FEED_LIMIT);
+
+    assignNextLocalTarget(volunteer, runtime.turfQueues, turfs, now);
+    if (!volunteer.active) {
+      activeVolunteers -= 1;
+    }
+  }
+
+  return activeVolunteers > 0;
+}
+
+function assignNextLocalTarget(
+  volunteer: RuntimeVolunteer,
+  turfQueues: Map<number, Voter[]>,
+  turfs: readonly Turf[],
+  now: number
+) {
+  const queue =
+    turfQueues.get(volunteer.currentTurfId)?.length
+      ? turfQueues.get(volunteer.currentTurfId)
+      : undefined;
+  const nextQueue = queue ?? randomOpenTurfQueue(turfQueues);
+  if (!nextQueue || nextQueue.length === 0) {
+    volunteer.active = false;
+    volunteer.targetVoterId = 0;
+    return;
+  }
+
+  const voter = nextQueue.shift();
+  if (!voter) {
+    volunteer.active = false;
+    volunteer.targetVoterId = 0;
+    return;
+  }
+
+  const nextTurf = turfs.find(turf => turf.id === voter.turfId);
+  volunteer.active = true;
+  volunteer.currentTurfId = voter.turfId;
+  volunteer.fromLat = volunteer.lat;
+  volunteer.fromLng = volunteer.lng;
+  volunteer.heading = headingBetween(volunteer.lat, volunteer.lng, voter.lat, voter.lng);
+  volunteer.targetDurationMs = randomKnockDelay();
+  volunteer.nextKnockAt = now + volunteer.targetDurationMs;
+  volunteer.targetAddress = voter.address;
+  volunteer.targetHouseholdName = voter.householdName;
+  volunteer.targetVoterId = voter.id;
+  volunteer.toLat = voter.lat;
+  volunteer.toLng = voter.lng;
+  volunteer.travelStartedAt = now;
+
+  if (nextTurf && distanceBetween(volunteer.lat, volunteer.lng, voter.lat, voter.lng) === 0) {
+    volunteer.fromLat = nextTurf.centerLat;
+    volunteer.fromLng = nextTurf.centerLng;
+  }
+}
+
+function applyLocalVoterPatches(
+  voters: readonly Voter[],
+  patches: Record<number, LocalVoterPatch>
+) {
+  if (Object.keys(patches).length === 0) {
+    return voters;
+  }
+  return voters.map(voter => {
+    const patch = patches[voter.id];
+    return patch ? { ...voter, ...patch } : voter;
+  });
+}
+
+function buildStatsFromVoters(
+  turfs: readonly Turf[],
+  voters: readonly Voter[],
+  volunteers: readonly MapVolunteer[]
+) {
+  return turfs.map(turf => {
+    const turfVoters = voters.filter(voter => voter.turfId === turf.id);
+    return {
+      activeVolunteerCount: volunteers.filter(
+        volunteer => volunteer.active && volunteer.currentTurfId === turf.id
+      ).length,
+      contactedCount: turfVoters.filter(voter => voter.status === STATUS_CONTACTED)
+        .length,
+      donatedCount: turfVoters.filter(voter => voter.status === STATUS_DONATED)
+        .length,
+      lastEventAt: latestLocalEventTime(turfVoters),
+      literatureDroppedCount: turfVoters.filter(
+        voter => voter.status === STATUS_LITERATURE
+      ).length,
+      notContactedCount: turfVoters.filter(
+        voter => voter.status === STATUS_NOT_CONTACTED
+      ).length,
+      refusedCount: turfVoters.filter(voter => voter.status === STATUS_REFUSED)
+        .length,
+      totalVoters: turfVoters.length,
+      turfId: turf.id,
+      updateCount: turfVoters.filter(voter => voter.updatedSeq > 0).length,
+    };
+  });
+}
+
+function toMapVolunteer(volunteer: RuntimeVolunteer, now: number): MapVolunteer {
+  const position = interpolatedPosition(volunteer, now);
+  return {
+    active: volunteer.active,
+    completedCount: volunteer.completedCount,
+    currentTurfId: volunteer.currentTurfId,
+    displayName: volunteer.displayName,
+    heading: volunteer.heading,
+    id: volunteer.id,
+    isSimulated: volunteer.isSimulated,
+    lat: position.lat,
+    lng: position.lng,
+    targetVoterId: volunteer.targetVoterId,
+    updatedAt: volunteer.updatedAt,
+  };
+}
+
+function interpolatedPosition(volunteer: RuntimeVolunteer, now: number) {
+  const duration = Math.max(1, volunteer.nextKnockAt - volunteer.travelStartedAt);
+  const progress = Math.min(1, Math.max(0, (now - volunteer.travelStartedAt) / duration));
+  return {
+    lat: volunteer.fromLat + (volunteer.toLat - volunteer.fromLat) * progress,
+    lng: volunteer.fromLng + (volunteer.toLng - volunteer.fromLng) * progress,
+  };
+}
+
+function totalVolunteerTime(runtime: LocalSimulationRuntime, now: number) {
+  const activeVolunteerMs = runtime.volunteers.reduce((sum, volunteer) => {
+    if (!volunteer.active || volunteer.targetVoterId === 0) {
+      return sum;
+    }
+    const elapsed = Math.min(
+      volunteer.targetDurationMs,
+      Math.max(0, now - volunteer.travelStartedAt)
+    );
+    return sum + elapsed;
+  }, 0);
+  return runtime.totalCompletedVolunteerMs + activeVolunteerMs;
+}
+
+function randomOpenTurfQueue(turfQueues: Map<number, Voter[]>) {
+  const openQueues = [...turfQueues.values()].filter(queue => queue.length > 0);
+  return openQueues.length > 0 ? randomItem(openQueues) : undefined;
+}
+
+function randomKnockDelay() {
+  return randomInt(LOCAL_SIM_MIN_KNOCK_MS, LOCAL_SIM_MAX_KNOCK_MS);
+}
+
+function randomKnockStatus() {
+  const roll = Math.random();
+  if (roll < 0.85) return STATUS_LITERATURE;
+  if (roll < 0.95) return STATUS_CONTACTED;
+  if (roll < 0.99) return STATUS_REFUSED;
+  return STATUS_DONATED;
+}
+
+function knockFeedLabel(status: string) {
+  if (status === STATUS_LITERATURE) return 'Lit drop';
+  if (status === STATUS_CONTACTED) return 'Contacted';
+  if (status === STATUS_REFUSED) return 'Refused';
+  if (status === STATUS_DONATED) return 'Donated';
+  return statusMeta(status).label;
+}
+
+function randomVolunteerName(index: number) {
+  return `${randomItem(FIRST_NAMES)} ${randomItem(LAST_NAMES)} ${index + 1}`;
+}
+
+function randomHeading() {
+  return Math.random() * Math.PI * 2;
+}
+
+function headingBetween(latA: number, lngA: number, latB: number, lngB: number) {
+  return Math.atan2(latB - latA, lngB - lngA);
+}
+
+function randomInt(min: number, max: number) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+function randomItem<T>(items: readonly T[]) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function shuffle<T>(items: readonly T[]) {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+  }
+  return copy;
+}
+
+function localTimestamp(ms: number): TimeValue {
+  return Timestamp.fromDate(new Date(ms));
+}
+
+function formatVolunteerTime(ms: number) {
+  const totalMinutes = Math.floor(ms / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours >= 1000) {
+    return `${Math.round(hours / 100) / 10}k h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  return `${minutes}m`;
+}
+
+function latestLocalEventTime(voters: readonly Voter[]) {
+  const latest = voters.reduce((max, voter) => {
+    const time = voter.lastContactedAt?.toDate?.().getTime() ?? 0;
+    return Math.max(max, time);
+  }, 0);
+  return latest > 0 ? localTimestamp(latest) : undefined;
 }
 
 function StatusBars({ stats }: { stats: TurfStats | undefined }) {
@@ -1398,12 +2072,14 @@ function Metric({
 }: {
   accent?: 'strong';
   label: string;
-  value: number;
+  value: number | string;
 }) {
   return (
     <div className={`metric ${accent ?? ''}`}>
       <span>{label}</span>
-      <strong>{value.toLocaleString()}</strong>
+      <strong>
+        {typeof value === 'number' ? value.toLocaleString() : value}
+      </strong>
     </div>
   );
 }
@@ -1488,25 +2164,21 @@ function buildOutcomeRowsFromStats(stats: readonly TurfStats[]) {
       count: literature,
       label: 'Literature',
       status: STATUS_LITERATURE,
-      targetLabel: 'Target 80%',
     },
     {
       count: contacted + donated,
       label: 'Contacted',
       status: STATUS_CONTACTED,
-      targetLabel: 'Target 15%',
     },
     {
       count: refused,
       label: 'Refused',
       status: STATUS_REFUSED,
-      targetLabel: 'Target 5%',
     },
     {
       count: donated,
       label: 'Donated',
       status: STATUS_DONATED,
-      targetLabel: 'Contact subcase',
     },
   ];
 
@@ -1521,12 +2193,37 @@ function buildOutcomeRowsFromStats(stats: readonly TurfStats[]) {
   });
 }
 
+function buildTurfProgressRows(stats: readonly TurfStats[]) {
+  return stats
+    .map(row => {
+      const knocked = Math.max(0, row.totalVoters - row.notContactedCount);
+      const percent =
+        row.totalVoters > 0
+          ? Math.round((knocked / row.totalVoters) * 100)
+          : 0;
+      return {
+        completed: percent >= 100,
+        percent,
+        turfId: row.turfId,
+      };
+    })
+    .sort((a, b) => {
+      if (a.completed !== b.completed) {
+        return a.completed ? 1 : -1;
+      }
+      if (a.percent !== b.percent) {
+        return b.percent - a.percent;
+      }
+      return b.turfId - a.turfId;
+    });
+}
+
 function buildLiveTelemetry(
   events: readonly ActivityEvent[],
   stats: readonly TurfStats[],
   turfs: readonly Turf[],
   voters: readonly Voter[],
-  volunteers: readonly Volunteer[]
+  volunteers: readonly MapVolunteer[]
 ) {
   const now = Date.now();
   const sortedEvents = [...events].sort((a, b) => b.id - a.id);
@@ -1593,6 +2290,12 @@ function distanceBetween(latA: number, lngA: number, latB: number, lngB: number)
 
 function statusMeta(status: string) {
   return STATUS_META[status] ?? STATUS_META[STATUS_NOT_CONTACTED];
+}
+
+function mapVoterColor(voter: Voter) {
+  return voter.status === STATUS_NOT_CONTACTED
+    ? '#8f9792'
+    : statusMeta(voter.status).color;
 }
 
 function secondsAgo(timestamp: number) {

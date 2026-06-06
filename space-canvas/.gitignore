@@ -12,5 +12,6 @@ dist
 spacetime.local.json
 
 data/*.json
+data/*.jsonl
 data/*.csv
 !data/.gitkeep

@@ -103,8 +103,7 @@ try {
     'maincloud',
     '--module-path',
     'spacetimedb',
-    '--delete-data',
-    'never',
+    '--delete-data=never',
     '--yes=remote,migrate,break-clients',
   ]);
   run('npm', ['run', 'readiness:publish']);

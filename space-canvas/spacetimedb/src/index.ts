@@ -200,7 +200,9 @@ const SIM_DONATION_WITHIN_CONTACT_RATE = 0.2;
 const WALKING_SPEED_MPS = 1.35;
 const SERVER_SIM_TICK_MS = 420;
 const METERS_PER_DEGREE_LAT = 111320;
-const TARGET_VOTERS_PER_TURF = 200;
+const TARGET_VOTERS_PER_TURF = 100;
+const MAX_WALK_ROUTE_POINTS = 16;
+const MIN_BOUNDARY_PAD_DEGREES = 0.0007;
 const MAX_ACTIVITY_EVENTS = 5000;
 const TRAVIS_CENTER = { lat: 30.2672, lng: -97.7431 };
 const TRAVIS_BOUNDS = {
@@ -972,20 +974,16 @@ function seedRegisteredVoterHouseholds(ctx: any) {
     addHouseholdName(households[householdKey], row.name || parsed.NAME || '');
   }
 
-  const householdRows = Object.values(households).sort(compareHouseholds);
+  const turfGroups = spatiallyPartitionHouseholds(Object.values(households));
   let turfId = 1;
   let voterId = 1;
-  let current: HouseholdSeed[] = [];
-  let currentVoterTotal = 0;
 
-  const flushTurf = () => {
-    if (current.length === 0) {
-      return;
-    }
-
-    const geometry = geometryForHouseholds(current);
-    const precincts = uniqueSorted(current.map(row => row.precinct).filter(Boolean));
-    const zipCodes = uniqueSorted(current.map(row => row.zip5).filter(Boolean));
+  for (const group of turfGroups) {
+    const groupHouseholds = [...group].sort(compareHouseholds);
+    const geometry = geometryForHouseholds(groupHouseholds);
+    const precincts = uniqueSorted(groupHouseholds.map(row => row.precinct).filter(Boolean));
+    const zipCodes = uniqueSorted(groupHouseholds.map(row => row.zip5).filter(Boolean));
+    const totalVoters = totalRegisteredVoters(groupHouseholds);
     const neighborhood =
       precincts.length > 0
         ? `${precincts.slice(0, 3).join(', ')}${precincts.length > 3 ? ' +' : ''}`
@@ -1014,7 +1012,15 @@ function seedRegisteredVoterHouseholds(ctx: any) {
       last_event_at: undefined,
     });
 
-    for (const household of current) {
+    const turfStats = turfStatsAccessor(ctx);
+    const stats = turfStats.find(turfId);
+    if (stats) {
+      stats.total_voters = totalVoters;
+      stats.not_contacted_count = totalVoters;
+      turfStats.update(stats);
+    }
+
+    for (const household of groupHouseholds) {
       ctx.db.voter.insert({
         id: voterId,
         turf_id: turfId,
@@ -1037,23 +1043,8 @@ function seedRegisteredVoterHouseholds(ctx: any) {
       voterId += 1;
     }
 
-    recomputeTurfStats(ctx, turfId);
     turfId += 1;
-    current = [];
-    currentVoterTotal = 0;
-  };
-
-  for (const household of householdRows) {
-    if (
-      current.length > 0 &&
-      currentVoterTotal + household.count > TARGET_VOTERS_PER_TURF
-    ) {
-      flushTurf();
-    }
-    current.push(household);
-    currentVoterTotal += household.count;
   }
-  flushTurf();
   upsertSimState(ctx, 0, false, 0, 0);
 }
 
@@ -1273,6 +1264,104 @@ function compareHouseholds(a: HouseholdSeed, b: HouseholdSeed) {
   );
 }
 
+function spatiallyPartitionHouseholds(households: HouseholdSeed[]) {
+  return splitSpatialGroup(households).sort(compareTurfGroups);
+}
+
+function splitSpatialGroup(rows: HouseholdSeed[]): HouseholdSeed[][] {
+  const voterCount = totalRegisteredVoters(rows);
+  const desiredPieces = Math.ceil(voterCount / TARGET_VOTERS_PER_TURF);
+  if (rows.length <= 1 || desiredPieces <= 1) {
+    return [rows];
+  }
+
+  const axis = widerAxis(rows);
+  const sorted = [...rows].sort((a, b) => compareByAxis(a, b, axis));
+  const leftPieces = Math.max(1, Math.floor(desiredPieces / 2));
+  const leftTarget = (voterCount * leftPieces) / desiredPieces;
+  const splitIndex = weightedSplitIndex(sorted, leftTarget);
+  const left = sorted.slice(0, splitIndex);
+  const right = sorted.slice(splitIndex);
+  if (left.length === 0 || right.length === 0) {
+    return [sorted];
+  }
+  return [...splitSpatialGroup(left), ...splitSpatialGroup(right)];
+}
+
+function totalRegisteredVoters(rows: HouseholdSeed[]) {
+  return rows.reduce((sum, row) => sum + row.count, 0);
+}
+
+function widerAxis(rows: HouseholdSeed[]) {
+  const bbox = bboxForHouseholds(rows);
+  const westEastMeters = distanceMeters(
+    bbox.minLat,
+    bbox.minLng,
+    bbox.minLat,
+    bbox.maxLng
+  );
+  const southNorthMeters = distanceMeters(
+    bbox.minLat,
+    bbox.minLng,
+    bbox.maxLat,
+    bbox.minLng
+  );
+  return westEastMeters >= southNorthMeters ? 'lng' : 'lat';
+}
+
+function bboxForHouseholds(rows: HouseholdSeed[]) {
+  let maxLat = -Infinity;
+  let maxLng = -Infinity;
+  let minLat = Infinity;
+  let minLng = Infinity;
+  for (const row of rows) {
+    maxLat = Math.max(maxLat, row.lat);
+    maxLng = Math.max(maxLng, row.lng);
+    minLat = Math.min(minLat, row.lat);
+    minLng = Math.min(minLng, row.lng);
+  }
+  return { maxLat, maxLng, minLat, minLng };
+}
+
+function compareByAxis(a: HouseholdSeed, b: HouseholdSeed, axis: 'lat' | 'lng') {
+  if (axis === 'lng') {
+    return (
+      a.lng - b.lng ||
+      a.lat - b.lat ||
+      a.precinct.localeCompare(b.precinct) ||
+      a.householdKey.localeCompare(b.householdKey)
+    );
+  }
+  return (
+    a.lat - b.lat ||
+    a.lng - b.lng ||
+    a.precinct.localeCompare(b.precinct) ||
+    a.householdKey.localeCompare(b.householdKey)
+  );
+}
+
+function weightedSplitIndex(rows: HouseholdSeed[], target: number) {
+  let running = 0;
+  for (let index = 0; index < rows.length - 1; index += 1) {
+    const before = running;
+    running += rows[index].count;
+    if (running >= target) {
+      const splitBefore = Math.max(1, index);
+      const splitAfter = Math.min(rows.length - 1, index + 1);
+      return Math.abs(before - target) < Math.abs(running - target)
+        ? splitBefore
+        : splitAfter;
+    }
+  }
+  return Math.max(1, Math.min(rows.length - 1, Math.floor(rows.length / 2)));
+}
+
+function compareTurfGroups(a: HouseholdSeed[], b: HouseholdSeed[]) {
+  const centerA = weightedCenter(a);
+  const centerB = weightedCenter(b);
+  return centerA.lat - centerB.lat || centerA.lng - centerB.lng;
+}
+
 function householdName(household: HouseholdSeed) {
   const label = household.names[0]
     ? `${household.names[0]} household`
@@ -1283,48 +1372,139 @@ function householdName(household: HouseholdSeed) {
 }
 
 function geometryForHouseholds(households: HouseholdSeed[]) {
-  const latValues = households.map(row => row.lat);
-  const lngValues = households.map(row => row.lng);
-  const minLat = Math.min(...latValues);
-  const maxLat = Math.max(...latValues);
-  const minLng = Math.min(...lngValues);
-  const maxLng = Math.max(...lngValues);
-  const latPad = Math.max(0.0025, (maxLat - minLat) * 0.22);
-  const lngPad = Math.max(0.0025, (maxLng - minLng) * 0.22);
-  const boundary = [
-    {
-      lat: clamp(minLat - latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(minLng - lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-    {
-      lat: clamp(maxLat + latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(minLng - lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-    {
-      lat: clamp(maxLat + latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(maxLng + lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-    {
-      lat: clamp(minLat - latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(maxLng + lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-  ];
-  const center = {
-    lat: households.reduce((sum, row) => sum + row.lat, 0) / households.length,
-    lng: households.reduce((sum, row) => sum + row.lng, 0) / households.length,
-  };
-  const sorted = [...households].sort((a, b) => a.lat - b.lat || a.lng - b.lng);
-  const stride = Math.max(1, Math.floor(sorted.length / 10));
-  const walkRoute = sorted
-    .filter((_row, index) => index % stride === 0)
-    .slice(0, 12)
-    .map(row => ({ lat: row.lat, lng: row.lng }));
+  const center = weightedCenter(households);
+  const hullBoundary = convexHullBoundary(households);
+  const boundary =
+    hullBoundary.length >= 3 ? hullBoundary : bboxBoundary(bboxForHouseholds(households));
+  const walkRoute = walkingRoute(households);
 
   return {
     boundary,
     center,
     walkRoute: walkRoute.length > 0 ? walkRoute : [center],
   };
+}
+
+function weightedCenter(rows: HouseholdSeed[]) {
+  const total = totalRegisteredVoters(rows);
+  if (total <= 0) {
+    return rows[0] ?? TRAVIS_CENTER;
+  }
+  return rows.reduce(
+    (center, row) => ({
+      lat: center.lat + (row.lat * row.count) / total,
+      lng: center.lng + (row.lng * row.count) / total,
+    }),
+    { lat: 0, lng: 0 }
+  );
+}
+
+function convexHullBoundary(rows: HouseholdSeed[]) {
+  const seen: Record<string, boolean> = {};
+  const points = rows
+    .map(row => ({ lat: row.lat, lng: row.lng }))
+    .filter(point => {
+      const key = `${point.lat.toFixed(7)},${point.lng.toFixed(7)}`;
+      if (seen[key]) {
+        return false;
+      }
+      seen[key] = true;
+      return true;
+    })
+    .sort((a, b) => a.lng - b.lng || a.lat - b.lat);
+  if (points.length < 3) {
+    return [];
+  }
+
+  const lower: CoordinateSeed[] = [];
+  for (const point of points) {
+    while (
+      lower.length >= 2 &&
+      cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0
+    ) {
+      lower.pop();
+    }
+    lower.push(point);
+  }
+
+  const upper: CoordinateSeed[] = [];
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const point = points[index];
+    while (
+      upper.length >= 2 &&
+      cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0
+    ) {
+      upper.pop();
+    }
+    upper.push(point);
+  }
+
+  const hull = [...lower.slice(0, -1), ...upper.slice(0, -1)];
+  if (hull.length < 3) {
+    return [];
+  }
+  return hull.map(point => ({
+    lat: clamp(point.lat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
+    lng: clamp(point.lng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
+  }));
+}
+
+function cross(origin: CoordinateSeed, a: CoordinateSeed, b: CoordinateSeed) {
+  return (a.lng - origin.lng) * (b.lat - origin.lat) -
+    (a.lat - origin.lat) * (b.lng - origin.lng);
+}
+
+function bboxBoundary(bbox: {
+  maxLat: number;
+  maxLng: number;
+  minLat: number;
+  minLng: number;
+}) {
+  const padLat = Math.max(MIN_BOUNDARY_PAD_DEGREES, (bbox.maxLat - bbox.minLat) * 0.22);
+  const padLng = Math.max(MIN_BOUNDARY_PAD_DEGREES, (bbox.maxLng - bbox.minLng) * 0.22);
+  const minLat = clamp(bbox.minLat - padLat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat);
+  const maxLat = clamp(bbox.maxLat + padLat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat);
+  const minLng = clamp(bbox.minLng - padLng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng);
+  const maxLng = clamp(bbox.maxLng + padLng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng);
+  return [
+    { lat: minLat, lng: minLng },
+    { lat: maxLat, lng: minLng },
+    { lat: maxLat, lng: maxLng },
+    { lat: minLat, lng: maxLng },
+  ];
+}
+
+function walkingRoute(rows: HouseholdSeed[]) {
+  const remaining = [...rows];
+  const route: CoordinateSeed[] = [];
+  let current: HouseholdSeed | undefined =
+    remaining.find(row => row.lng === Math.min(...remaining.map(item => item.lng))) ??
+    remaining[0];
+  while (current && route.length < MAX_WALK_ROUTE_POINTS) {
+    route.push({ lat: current.lat, lng: current.lng });
+    remaining.splice(remaining.indexOf(current), 1);
+    current = nearestHousehold(current, remaining);
+  }
+  return route;
+}
+
+function nearestHousehold(origin: HouseholdSeed, rows: HouseholdSeed[]) {
+  let nearest: HouseholdSeed | undefined;
+  let bestDistance = Infinity;
+  for (const row of rows) {
+    const distance = approximateDistanceSquared(origin, row);
+    if (distance < bestDistance) {
+      nearest = row;
+      bestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function approximateDistanceSquared(a: CoordinateSeed, b: CoordinateSeed) {
+  const latDelta = b.lat - a.lat;
+  const lngDelta = (b.lng - a.lng) * Math.cos(((a.lat + b.lat) / 2) * (Math.PI / 180));
+  return latDelta * latDelta + lngDelta * lngDelta;
 }
 
 function uniqueSorted(values: string[]) {
