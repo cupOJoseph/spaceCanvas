@@ -131,6 +131,30 @@ const registeredVoterImportRow = t.object('RegisteredVoterImportRow', {
   payload: t.string(),
 });
 
+const derivedTurfImportRow = t.object('DerivedTurfImportRow', {
+  id: t.u32(),
+  name: t.string(),
+  neighborhood: t.string(),
+  center_lat: t.f64(),
+  center_lng: t.f64(),
+  boundary: t.array(coordinate),
+  walk_route: t.array(coordinate),
+});
+
+const derivedVoterImportRow = t.object('DerivedVoterImportRow', {
+  id: t.u32(),
+  turf_id: t.u32(),
+  household_key: t.string(),
+  registered_voter_count: t.u32(),
+  household_name: t.string(),
+  address: t.string(),
+  precinct: t.string(),
+  source_city: t.string(),
+  source_zip5: t.string(),
+  lat: t.f64(),
+  lng: t.f64(),
+});
+
 const registeredVoter = table(
   {
     name: 'registered_voter',
@@ -427,14 +451,75 @@ export const importRegisteredVoters = spacetimedb.reducer(
 );
 
 export const resetDemoData = spacetimedb.reducer({}, ctx => {
-  clearTable(ctx, 'activityEvent');
-  clearTable(ctx, 'volunteer');
-  clearTable(ctx, 'voter');
-  clearTable(ctx, 'turfStats');
-  clearTable(ctx, 'turf');
-  clearTable(ctx, 'simState');
+  clearDerivedTables(ctx);
   seedData(ctx);
 });
+
+export const clearDerivedData = spacetimedb.reducer({}, ctx => {
+  clearDerivedTables(ctx);
+});
+
+export const importDerivedDataBatch = spacetimedb.reducer(
+  {
+    turfs: t.array(derivedTurfImportRow),
+    voters: t.array(derivedVoterImportRow),
+    finalBatch: t.bool(),
+  },
+  (ctx, { turfs, voters, finalBatch }) => {
+    for (const row of turfs) {
+      ctx.db.turf.insert(row);
+      ensureTurfStatsRow(ctx, row.id);
+    }
+
+    const touchedTurfs: Record<number, boolean> = {};
+    for (const row of voters) {
+      ctx.db.voter.insert({
+        id: row.id,
+        turf_id: row.turf_id,
+        household_key: row.household_key,
+        registered_voter_count: row.registered_voter_count,
+        household_name: row.household_name,
+        address: row.address,
+        precinct: row.precinct,
+        source_city: row.source_city,
+        source_zip5: row.source_zip5,
+        lat: row.lat,
+        lng: row.lng,
+        status: STATUS_NOT_CONTACTED,
+        last_contacted_at: undefined,
+        last_contacted_by: undefined,
+        attempt_count: 0,
+        donation_cents: 0,
+        updated_seq: 0,
+      });
+      incrementImportedTurfStats(ctx, row.turf_id, row.registered_voter_count);
+      touchedTurfs[row.turf_id] = true;
+    }
+
+    for (const turfIdText of Object.keys(touchedTurfs)) {
+      const turfId = Number(turfIdText);
+      const stats = ctx.db.turfStats.turf_id.find(turfId);
+      if (stats) {
+        stats.update_count += 1;
+        ctx.db.turfStats.turf_id.update(stats);
+      }
+    }
+
+    if (finalBatch) {
+      upsertSimState(ctx, 0, false, 0, 0);
+      logActivity(ctx, {
+        turfId: turfs[0]?.id ?? 1,
+        voterId: undefined,
+        volunteerId: undefined,
+        eventType: 'materialization_complete',
+        status: 'active',
+        message: `Imported ${ctx.db.voter.count()} household knock targets from registered voters`,
+        lat: TRAVIS_CENTER.lat,
+        lng: TRAVIS_CENTER.lng,
+      });
+    }
+  }
+);
 
 export const claimTurf = spacetimedb.reducer(
   { displayName: t.string(), preferredTurfId: t.u32() },
@@ -722,6 +807,15 @@ function seedIfEmpty(ctx: any) {
   }
 }
 
+function clearDerivedTables(ctx: any) {
+  clearTable(ctx, 'activityEvent');
+  clearTable(ctx, 'volunteer');
+  clearTable(ctx, 'voter');
+  clearTable(ctx, 'turfStats');
+  clearTable(ctx, 'turf');
+  clearTable(ctx, 'simState');
+}
+
 function seedData(ctx: any) {
   if (ctx.db.registeredVoter.count() > 0) {
     seedRegisteredVoterHouseholds(ctx);
@@ -729,6 +823,36 @@ function seedData(ctx: any) {
   }
 
   seedFallbackTurfVoters(ctx);
+}
+
+function ensureTurfStatsRow(ctx: any, turfId: number) {
+  if (ctx.db.turfStats.turfId.find(turfId)) {
+    return;
+  }
+  ctx.db.turfStats.insert({
+    turf_id: turfId,
+    total_voters: 0,
+    not_contacted_count: 0,
+    contacted_count: 0,
+    literature_dropped_count: 0,
+    refused_count: 0,
+    donated_count: 0,
+    active_volunteer_count: 0,
+    update_count: 0,
+    last_event_at: undefined,
+  });
+}
+
+function incrementImportedTurfStats(ctx: any, turfId: number, voterCount: number) {
+  ensureTurfStatsRow(ctx, turfId);
+  const stats = ctx.db.turfStats.turfId.find(turfId);
+  if (!stats) {
+    return;
+  }
+  const weight = Math.max(1, voterCount);
+  stats.total_voters += weight;
+  stats.not_contacted_count += weight;
+  ctx.db.turfStats.turfId.update(stats);
 }
 
 function seedRegisteredVoterHouseholds(ctx: any) {

@@ -33,6 +33,8 @@ const requiredTables = [
 const requiredReducers = [
   'importRegisteredVoters',
   'resetDemoData',
+  'clearDerivedData',
+  'importDerivedDataBatch',
   'claimTurf',
   'updateVolunteerLocation',
   'updateVoterStatus',
