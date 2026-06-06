@@ -67,13 +67,13 @@ addCheck(
   'simulator UI displays live outcome distribution',
   app.includes('function buildOutcomeRows') &&
     app.includes('Outcome distribution') &&
-    app.includes('Target 80%') &&
-    app.includes('Target 15%') &&
-    app.includes('Target 5%') &&
-    app.includes('Contact subcase') &&
+    app.includes("label: 'Literature'") &&
+    app.includes("label: 'Contacted'") &&
+    app.includes("label: 'Refused'") &&
+    app.includes("label: 'Donated'") &&
     css.includes('.outcome-panel') &&
     css.includes('.outcome-row'),
-  'simulator panel shows observed literature, contact, refusal, and donation counts against requested targets'
+  'simulator panel shows observed literature, contact, refusal, and donation counts'
 );
 addCheck(
   'Node simulator scripts share one SpacetimeDB client schema',
@@ -351,8 +351,7 @@ addCheck(
 );
 addCheck(
   'prod publish wrapper avoids destructive data deletion',
-  publishProd.includes("'--delete-data',") &&
-    publishProd.includes("'never'") &&
+  publishProd.includes("'--delete-data=never'") &&
     publishProd.includes('run(cli, [') &&
     publishProd.includes("'publish'") &&
     publishProd.includes("'spacecanvas-5rvak'") &&

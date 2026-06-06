@@ -131,6 +131,30 @@ const registeredVoterImportRow = t.object('RegisteredVoterImportRow', {
   payload: t.string(),
 });
 
+const derivedTurfImportRow = t.object('DerivedTurfImportRow', {
+  id: t.u32(),
+  name: t.string(),
+  neighborhood: t.string(),
+  center_lat: t.f64(),
+  center_lng: t.f64(),
+  boundary: t.array(coordinate),
+  walk_route: t.array(coordinate),
+});
+
+const derivedVoterImportRow = t.object('DerivedVoterImportRow', {
+  id: t.u32(),
+  turf_id: t.u32(),
+  household_key: t.string(),
+  registered_voter_count: t.u32(),
+  household_name: t.string(),
+  address: t.string(),
+  precinct: t.string(),
+  source_city: t.string(),
+  source_zip5: t.string(),
+  lat: t.f64(),
+  lng: t.f64(),
+});
+
 const registeredVoter = table(
   {
     name: 'registered_voter',
@@ -176,7 +200,9 @@ const SIM_DONATION_WITHIN_CONTACT_RATE = 0.2;
 const WALKING_SPEED_MPS = 1.35;
 const SERVER_SIM_TICK_MS = 420;
 const METERS_PER_DEGREE_LAT = 111320;
-const TARGET_VOTERS_PER_TURF = 200;
+const TARGET_VOTERS_PER_TURF = 100;
+const MAX_WALK_ROUTE_POINTS = 16;
+const MIN_BOUNDARY_PAD_DEGREES = 0.0007;
 const MAX_ACTIVITY_EVENTS = 5000;
 const TRAVIS_CENTER = { lat: 30.2672, lng: -97.7431 };
 const TRAVIS_BOUNDS = {
@@ -427,14 +453,35 @@ export const importRegisteredVoters = spacetimedb.reducer(
 );
 
 export const resetDemoData = spacetimedb.reducer({}, ctx => {
-  clearTable(ctx, 'activityEvent');
-  clearTable(ctx, 'volunteer');
-  clearTable(ctx, 'voter');
-  clearTable(ctx, 'turfStats');
-  clearTable(ctx, 'turf');
-  clearTable(ctx, 'simState');
+  clearDerivedTables(ctx);
   seedData(ctx);
 });
+
+export const clearDerivedData = spacetimedb.reducer({}, ctx => {
+  clearDerivedTables(ctx);
+});
+
+export const importDerivedDataBatch = spacetimedb.reducer(
+  {
+    turfs: t.array(derivedTurfImportRow),
+    voters: t.array(derivedVoterImportRow),
+    finalBatch: t.bool(),
+  },
+  (ctx, { turfs, voters, finalBatch }) => {
+    importDerivedRows(ctx, turfs, voters, finalBatch);
+  }
+);
+
+export const importDerivedDataJsonBatch = spacetimedb.reducer(
+  {
+    payloadJson: t.string(),
+    finalBatch: t.bool(),
+  },
+  (ctx, { payloadJson, finalBatch }) => {
+    const parsed = JSON.parse(payloadJson);
+    importDerivedRows(ctx, parsed.turfs ?? [], parsed.voters ?? [], finalBatch);
+  }
+);
 
 export const claimTurf = spacetimedb.reducer(
   { displayName: t.string(), preferredTurfId: t.u32() },
@@ -632,7 +679,7 @@ export const seedSimulation = spacetimedb.reducer(
         current_turf_id: assignedTurf.id,
         lat: routePoint.lat,
         lng: routePoint.lng,
-        heading: randomHeading(),
+        heading: randomHeading(ctx),
         active: true,
         is_simulated: true,
         target_voter_id: 0,
@@ -722,6 +769,15 @@ function seedIfEmpty(ctx: any) {
   }
 }
 
+function clearDerivedTables(ctx: any) {
+  clearTable(ctx, 'activityEvent');
+  clearTable(ctx, 'volunteer');
+  clearTable(ctx, 'voter');
+  clearTable(ctx, 'turfStats');
+  clearTable(ctx, 'turf');
+  clearTable(ctx, 'simState');
+}
+
 function seedData(ctx: any) {
   if (ctx.db.registeredVoter.count() > 0) {
     seedRegisteredVoterHouseholds(ctx);
@@ -729,6 +785,157 @@ function seedData(ctx: any) {
   }
 
   seedFallbackTurfVoters(ctx);
+}
+
+function ensureTurfStatsRow(ctx: any, turfId: number) {
+  const turfStats = turfStatsAccessor(ctx);
+  if (turfStats.find(turfId)) {
+    return;
+  }
+  ctx.db.turfStats.insert({
+    turf_id: turfId,
+    total_voters: 0,
+    not_contacted_count: 0,
+    contacted_count: 0,
+    literature_dropped_count: 0,
+    refused_count: 0,
+    donated_count: 0,
+    active_volunteer_count: 0,
+    update_count: 0,
+    last_event_at: undefined,
+  });
+}
+
+function normalizeImportedTurf(row: any) {
+  return {
+    id: row.id,
+    name: row.name,
+    neighborhood: row.neighborhood,
+    center_lat: row.center_lat ?? row.centerLat,
+    center_lng: row.center_lng ?? row.centerLng,
+    boundary: row.boundary,
+    walk_route: row.walk_route ?? row.walkRoute,
+  };
+}
+
+function normalizeImportedVoter(row: any) {
+  return {
+    id: row.id,
+    turfId: row.turf_id ?? row.turfId,
+    householdKey: row.household_key ?? row.householdKey,
+    registeredVoterCount:
+      row.registered_voter_count ?? row.registeredVoterCount,
+    householdName: row.household_name ?? row.householdName,
+    address: row.address,
+    precinct: row.precinct,
+    sourceCity: row.source_city ?? row.sourceCity,
+    sourceZip5: row.source_zip5 ?? row.sourceZip5,
+    lat: row.lat,
+    lng: row.lng,
+  };
+}
+
+function importDerivedRows(
+  ctx: any,
+  turfs: any[],
+  voters: any[],
+  finalBatch: boolean
+) {
+  for (const row of turfs) {
+    const turfRow = normalizeImportedTurf(row);
+    const existing = ctx.db.turf.id.find(turfRow.id);
+    if (existing) {
+      Object.assign(existing, turfRow);
+      ctx.db.turf.id.update(existing);
+    } else {
+      ctx.db.turf.insert(turfRow);
+    }
+    ensureTurfStatsRow(ctx, turfRow.id);
+  }
+
+  const touchedTurfs: Record<number, boolean> = {};
+  for (const row of voters) {
+    const imported = normalizeImportedVoter(row);
+    const existing = ctx.db.voter.id.find(imported.id);
+    const voterRow = {
+      id: imported.id,
+      turf_id: imported.turfId,
+      turfId: imported.turfId,
+      household_key: imported.householdKey,
+      householdKey: imported.householdKey,
+      registered_voter_count: imported.registeredVoterCount,
+      registeredVoterCount: imported.registeredVoterCount,
+      household_name: imported.householdName,
+      householdName: imported.householdName,
+      address: imported.address,
+      precinct: imported.precinct,
+      source_city: imported.sourceCity,
+      sourceCity: imported.sourceCity,
+      source_zip5: imported.sourceZip5,
+      sourceZip5: imported.sourceZip5,
+      lat: imported.lat,
+      lng: imported.lng,
+      status: STATUS_NOT_CONTACTED,
+      last_contacted_at: undefined,
+      lastContactedAt: undefined,
+      last_contacted_by: undefined,
+      lastContactedBy: undefined,
+      attempt_count: 0,
+      attemptCount: 0,
+      donation_cents: 0,
+      donationCents: 0,
+      updated_seq: 0,
+      updatedSeq: 0,
+    };
+    if (existing) {
+      Object.assign(existing, voterRow);
+      ctx.db.voter.id.update(existing);
+    } else {
+      ctx.db.voter.insert(voterRow);
+      incrementImportedTurfStats(
+        ctx,
+        imported.turfId,
+        imported.registeredVoterCount
+      );
+    }
+    touchedTurfs[imported.turfId] = true;
+  }
+
+  for (const turfIdText of Object.keys(touchedTurfs)) {
+    const turfId = Number(turfIdText);
+    recomputeTurfStats(ctx, turfId);
+  }
+
+  if (finalBatch) {
+    upsertSimState(ctx, 0, false, 0, 0);
+    logActivity(ctx, {
+      turfId: turfs[0]?.id ?? 1,
+      voterId: undefined,
+      volunteerId: undefined,
+      eventType: 'materialization_complete',
+      status: 'active',
+      message: `Imported ${ctx.db.voter.count()} household knock targets from registered voters`,
+      lat: TRAVIS_CENTER.lat,
+      lng: TRAVIS_CENTER.lng,
+    });
+  }
+}
+
+function incrementImportedTurfStats(ctx: any, turfId: number, voterCount: number) {
+  ensureTurfStatsRow(ctx, turfId);
+  const turfStats = turfStatsAccessor(ctx);
+  const stats = turfStats.find(turfId);
+  if (!stats) {
+    return;
+  }
+  const weight = Math.max(1, voterCount);
+  stats.total_voters += weight;
+  stats.not_contacted_count += weight;
+  turfStats.update(stats);
+}
+
+function turfStatsAccessor(ctx: any) {
+  return ctx.db.turfStats.turf_id ?? ctx.db.turfStats.turfId;
 }
 
 function seedRegisteredVoterHouseholds(ctx: any) {
@@ -767,20 +974,16 @@ function seedRegisteredVoterHouseholds(ctx: any) {
     addHouseholdName(households[householdKey], row.name || parsed.NAME || '');
   }
 
-  const householdRows = Object.values(households).sort(compareHouseholds);
+  const turfGroups = spatiallyPartitionHouseholds(Object.values(households));
   let turfId = 1;
   let voterId = 1;
-  let current: HouseholdSeed[] = [];
-  let currentVoterTotal = 0;
 
-  const flushTurf = () => {
-    if (current.length === 0) {
-      return;
-    }
-
-    const geometry = geometryForHouseholds(current);
-    const precincts = uniqueSorted(current.map(row => row.precinct).filter(Boolean));
-    const zipCodes = uniqueSorted(current.map(row => row.zip5).filter(Boolean));
+  for (const group of turfGroups) {
+    const groupHouseholds = [...group].sort(compareHouseholds);
+    const geometry = geometryForHouseholds(groupHouseholds);
+    const precincts = uniqueSorted(groupHouseholds.map(row => row.precinct).filter(Boolean));
+    const zipCodes = uniqueSorted(groupHouseholds.map(row => row.zip5).filter(Boolean));
+    const totalVoters = totalRegisteredVoters(groupHouseholds);
     const neighborhood =
       precincts.length > 0
         ? `${precincts.slice(0, 3).join(', ')}${precincts.length > 3 ? ' +' : ''}`
@@ -809,7 +1012,15 @@ function seedRegisteredVoterHouseholds(ctx: any) {
       last_event_at: undefined,
     });
 
-    for (const household of current) {
+    const turfStats = turfStatsAccessor(ctx);
+    const stats = turfStats.find(turfId);
+    if (stats) {
+      stats.total_voters = totalVoters;
+      stats.not_contacted_count = totalVoters;
+      turfStats.update(stats);
+    }
+
+    for (const household of groupHouseholds) {
       ctx.db.voter.insert({
         id: voterId,
         turf_id: turfId,
@@ -832,23 +1043,8 @@ function seedRegisteredVoterHouseholds(ctx: any) {
       voterId += 1;
     }
 
-    recomputeTurfStats(ctx, turfId);
     turfId += 1;
-    current = [];
-    currentVoterTotal = 0;
-  };
-
-  for (const household of householdRows) {
-    if (
-      current.length > 0 &&
-      currentVoterTotal + household.count > TARGET_VOTERS_PER_TURF
-    ) {
-      flushTurf();
-    }
-    current.push(household);
-    currentVoterTotal += household.count;
   }
-  flushTurf();
   upsertSimState(ctx, 0, false, 0, 0);
 }
 
@@ -1068,6 +1264,104 @@ function compareHouseholds(a: HouseholdSeed, b: HouseholdSeed) {
   );
 }
 
+function spatiallyPartitionHouseholds(households: HouseholdSeed[]) {
+  return splitSpatialGroup(households).sort(compareTurfGroups);
+}
+
+function splitSpatialGroup(rows: HouseholdSeed[]): HouseholdSeed[][] {
+  const voterCount = totalRegisteredVoters(rows);
+  const desiredPieces = Math.ceil(voterCount / TARGET_VOTERS_PER_TURF);
+  if (rows.length <= 1 || desiredPieces <= 1) {
+    return [rows];
+  }
+
+  const axis = widerAxis(rows);
+  const sorted = [...rows].sort((a, b) => compareByAxis(a, b, axis));
+  const leftPieces = Math.max(1, Math.floor(desiredPieces / 2));
+  const leftTarget = (voterCount * leftPieces) / desiredPieces;
+  const splitIndex = weightedSplitIndex(sorted, leftTarget);
+  const left = sorted.slice(0, splitIndex);
+  const right = sorted.slice(splitIndex);
+  if (left.length === 0 || right.length === 0) {
+    return [sorted];
+  }
+  return [...splitSpatialGroup(left), ...splitSpatialGroup(right)];
+}
+
+function totalRegisteredVoters(rows: HouseholdSeed[]) {
+  return rows.reduce((sum, row) => sum + row.count, 0);
+}
+
+function widerAxis(rows: HouseholdSeed[]) {
+  const bbox = bboxForHouseholds(rows);
+  const westEastMeters = distanceMeters(
+    bbox.minLat,
+    bbox.minLng,
+    bbox.minLat,
+    bbox.maxLng
+  );
+  const southNorthMeters = distanceMeters(
+    bbox.minLat,
+    bbox.minLng,
+    bbox.maxLat,
+    bbox.minLng
+  );
+  return westEastMeters >= southNorthMeters ? 'lng' : 'lat';
+}
+
+function bboxForHouseholds(rows: HouseholdSeed[]) {
+  let maxLat = -Infinity;
+  let maxLng = -Infinity;
+  let minLat = Infinity;
+  let minLng = Infinity;
+  for (const row of rows) {
+    maxLat = Math.max(maxLat, row.lat);
+    maxLng = Math.max(maxLng, row.lng);
+    minLat = Math.min(minLat, row.lat);
+    minLng = Math.min(minLng, row.lng);
+  }
+  return { maxLat, maxLng, minLat, minLng };
+}
+
+function compareByAxis(a: HouseholdSeed, b: HouseholdSeed, axis: 'lat' | 'lng') {
+  if (axis === 'lng') {
+    return (
+      a.lng - b.lng ||
+      a.lat - b.lat ||
+      a.precinct.localeCompare(b.precinct) ||
+      a.householdKey.localeCompare(b.householdKey)
+    );
+  }
+  return (
+    a.lat - b.lat ||
+    a.lng - b.lng ||
+    a.precinct.localeCompare(b.precinct) ||
+    a.householdKey.localeCompare(b.householdKey)
+  );
+}
+
+function weightedSplitIndex(rows: HouseholdSeed[], target: number) {
+  let running = 0;
+  for (let index = 0; index < rows.length - 1; index += 1) {
+    const before = running;
+    running += rows[index].count;
+    if (running >= target) {
+      const splitBefore = Math.max(1, index);
+      const splitAfter = Math.min(rows.length - 1, index + 1);
+      return Math.abs(before - target) < Math.abs(running - target)
+        ? splitBefore
+        : splitAfter;
+    }
+  }
+  return Math.max(1, Math.min(rows.length - 1, Math.floor(rows.length / 2)));
+}
+
+function compareTurfGroups(a: HouseholdSeed[], b: HouseholdSeed[]) {
+  const centerA = weightedCenter(a);
+  const centerB = weightedCenter(b);
+  return centerA.lat - centerB.lat || centerA.lng - centerB.lng;
+}
+
 function householdName(household: HouseholdSeed) {
   const label = household.names[0]
     ? `${household.names[0]} household`
@@ -1078,48 +1372,139 @@ function householdName(household: HouseholdSeed) {
 }
 
 function geometryForHouseholds(households: HouseholdSeed[]) {
-  const latValues = households.map(row => row.lat);
-  const lngValues = households.map(row => row.lng);
-  const minLat = Math.min(...latValues);
-  const maxLat = Math.max(...latValues);
-  const minLng = Math.min(...lngValues);
-  const maxLng = Math.max(...lngValues);
-  const latPad = Math.max(0.0025, (maxLat - minLat) * 0.22);
-  const lngPad = Math.max(0.0025, (maxLng - minLng) * 0.22);
-  const boundary = [
-    {
-      lat: clamp(minLat - latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(minLng - lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-    {
-      lat: clamp(maxLat + latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(minLng - lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-    {
-      lat: clamp(maxLat + latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(maxLng + lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-    {
-      lat: clamp(minLat - latPad, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
-      lng: clamp(maxLng + lngPad, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
-    },
-  ];
-  const center = {
-    lat: households.reduce((sum, row) => sum + row.lat, 0) / households.length,
-    lng: households.reduce((sum, row) => sum + row.lng, 0) / households.length,
-  };
-  const sorted = [...households].sort((a, b) => a.lat - b.lat || a.lng - b.lng);
-  const stride = Math.max(1, Math.floor(sorted.length / 10));
-  const walkRoute = sorted
-    .filter((_row, index) => index % stride === 0)
-    .slice(0, 12)
-    .map(row => ({ lat: row.lat, lng: row.lng }));
+  const center = weightedCenter(households);
+  const hullBoundary = convexHullBoundary(households);
+  const boundary =
+    hullBoundary.length >= 3 ? hullBoundary : bboxBoundary(bboxForHouseholds(households));
+  const walkRoute = walkingRoute(households);
 
   return {
     boundary,
     center,
     walkRoute: walkRoute.length > 0 ? walkRoute : [center],
   };
+}
+
+function weightedCenter(rows: HouseholdSeed[]) {
+  const total = totalRegisteredVoters(rows);
+  if (total <= 0) {
+    return rows[0] ?? TRAVIS_CENTER;
+  }
+  return rows.reduce(
+    (center, row) => ({
+      lat: center.lat + (row.lat * row.count) / total,
+      lng: center.lng + (row.lng * row.count) / total,
+    }),
+    { lat: 0, lng: 0 }
+  );
+}
+
+function convexHullBoundary(rows: HouseholdSeed[]) {
+  const seen: Record<string, boolean> = {};
+  const points = rows
+    .map(row => ({ lat: row.lat, lng: row.lng }))
+    .filter(point => {
+      const key = `${point.lat.toFixed(7)},${point.lng.toFixed(7)}`;
+      if (seen[key]) {
+        return false;
+      }
+      seen[key] = true;
+      return true;
+    })
+    .sort((a, b) => a.lng - b.lng || a.lat - b.lat);
+  if (points.length < 3) {
+    return [];
+  }
+
+  const lower: CoordinateSeed[] = [];
+  for (const point of points) {
+    while (
+      lower.length >= 2 &&
+      cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0
+    ) {
+      lower.pop();
+    }
+    lower.push(point);
+  }
+
+  const upper: CoordinateSeed[] = [];
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    const point = points[index];
+    while (
+      upper.length >= 2 &&
+      cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0
+    ) {
+      upper.pop();
+    }
+    upper.push(point);
+  }
+
+  const hull = [...lower.slice(0, -1), ...upper.slice(0, -1)];
+  if (hull.length < 3) {
+    return [];
+  }
+  return hull.map(point => ({
+    lat: clamp(point.lat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat),
+    lng: clamp(point.lng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng),
+  }));
+}
+
+function cross(origin: CoordinateSeed, a: CoordinateSeed, b: CoordinateSeed) {
+  return (a.lng - origin.lng) * (b.lat - origin.lat) -
+    (a.lat - origin.lat) * (b.lng - origin.lng);
+}
+
+function bboxBoundary(bbox: {
+  maxLat: number;
+  maxLng: number;
+  minLat: number;
+  minLng: number;
+}) {
+  const padLat = Math.max(MIN_BOUNDARY_PAD_DEGREES, (bbox.maxLat - bbox.minLat) * 0.22);
+  const padLng = Math.max(MIN_BOUNDARY_PAD_DEGREES, (bbox.maxLng - bbox.minLng) * 0.22);
+  const minLat = clamp(bbox.minLat - padLat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat);
+  const maxLat = clamp(bbox.maxLat + padLat, TRAVIS_BOUNDS.minLat, TRAVIS_BOUNDS.maxLat);
+  const minLng = clamp(bbox.minLng - padLng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng);
+  const maxLng = clamp(bbox.maxLng + padLng, TRAVIS_BOUNDS.minLng, TRAVIS_BOUNDS.maxLng);
+  return [
+    { lat: minLat, lng: minLng },
+    { lat: maxLat, lng: minLng },
+    { lat: maxLat, lng: maxLng },
+    { lat: minLat, lng: maxLng },
+  ];
+}
+
+function walkingRoute(rows: HouseholdSeed[]) {
+  const remaining = [...rows];
+  const route: CoordinateSeed[] = [];
+  let current: HouseholdSeed | undefined =
+    remaining.find(row => row.lng === Math.min(...remaining.map(item => item.lng))) ??
+    remaining[0];
+  while (current && route.length < MAX_WALK_ROUTE_POINTS) {
+    route.push({ lat: current.lat, lng: current.lng });
+    remaining.splice(remaining.indexOf(current), 1);
+    current = nearestHousehold(current, remaining);
+  }
+  return route;
+}
+
+function nearestHousehold(origin: HouseholdSeed, rows: HouseholdSeed[]) {
+  let nearest: HouseholdSeed | undefined;
+  let bestDistance = Infinity;
+  for (const row of rows) {
+    const distance = approximateDistanceSquared(origin, row);
+    if (distance < bestDistance) {
+      nearest = row;
+      bestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function approximateDistanceSquared(a: CoordinateSeed, b: CoordinateSeed) {
+  const latDelta = b.lat - a.lat;
+  const lngDelta = (b.lng - a.lng) * Math.cos(((a.lat + b.lat) / 2) * (Math.PI / 180));
+  return latDelta * latDelta + lngDelta * lngDelta;
 }
 
 function uniqueSorted(values: string[]) {
@@ -1137,12 +1522,12 @@ function hashString(value: string) {
 
 function clearTable(ctx: any, accessorName: string) {
   const ids = Array.from(ctx.db[accessorName].iter()).map((row: any) => row.id ?? row.turf_id);
+  const tableAccessor =
+    accessorName === 'turfStats'
+      ? turfStatsAccessor(ctx)
+      : ctx.db[accessorName].id;
   for (const id of ids) {
-    if (accessorName === 'turfStats') {
-      ctx.db[accessorName].turfId.delete(id);
-    } else {
-      ctx.db[accessorName].id.delete(id);
-    }
+    tableAccessor.delete(id);
   }
 }
 
@@ -1155,7 +1540,7 @@ function chooseTurf(ctx: any, preferredTurfId: number) {
   if (turfs.length === 0) {
     throw new Error('No turfs are available');
   }
-  return turfs[Math.floor(Math.random() * turfs.length)];
+  return turfs[randomIndex(ctx, turfs.length)];
 }
 
 function findHumanVolunteerForSender(ctx: any) {
@@ -1251,7 +1636,7 @@ function recomputeTurfStats(ctx: any, turfId: number) {
   let refused = 0;
   let donated = 0;
   for (const row of ctx.db.voter.by_turf.filter(turfId)) {
-    const weight = row.registered_voter_count || 1;
+    const weight = registeredVoterWeight(row);
     total += weight;
     if (row.status === STATUS_CONTACTED) contacted += weight;
     else if (row.status === STATUS_LITERATURE) literature += weight;
@@ -1266,7 +1651,8 @@ function recomputeTurfStats(ctx: any, turfId: number) {
     }
   }
 
-  const existing = ctx.db.turfStats.turfId.find(turfId);
+  const turfStats = turfStatsAccessor(ctx);
+  const existing = turfStats.find(turfId);
   if (existing) {
     existing.total_voters = total;
     existing.not_contacted_count = notContacted;
@@ -1276,7 +1662,7 @@ function recomputeTurfStats(ctx: any, turfId: number) {
     existing.donated_count = donated;
     existing.active_volunteer_count = activeVolunteers;
     existing.update_count += 1;
-    ctx.db.turfStats.turfId.update(existing);
+    turfStats.update(existing);
   } else {
     ctx.db.turfStats.insert({
       turf_id: turfId,
@@ -1291,6 +1677,31 @@ function recomputeTurfStats(ctx: any, turfId: number) {
       last_event_at: undefined,
     });
   }
+}
+
+function registeredVoterWeight(row: any) {
+  return optionNumber(
+    row.registered_voter_count ?? row.registeredVoterCount,
+    1
+  );
+}
+
+function optionNumber(value: any, fallback: number) {
+  if (typeof value === 'number') {
+    return Math.max(1, value);
+  }
+  if (value && typeof value === 'object') {
+    if (typeof value.some === 'number') {
+      return Math.max(1, value.some);
+    }
+    if (typeof value.value === 'number') {
+      return Math.max(1, value.value);
+    }
+    if (typeof value.Some === 'number') {
+      return Math.max(1, value.Some);
+    }
+  }
+  return fallback;
 }
 
 function logActivity(
@@ -1319,11 +1730,12 @@ function logActivity(
     created_at: ctx.timestamp,
   });
 
-  const stats = ctx.db.turfStats.turfId.find(event.turfId);
+  const turfStats = turfStatsAccessor(ctx);
+  const stats = turfStats.find(event.turfId);
   if (stats) {
     stats.last_event_at = ctx.timestamp;
     stats.update_count += 1;
-    ctx.db.turfStats.turfId.update(stats);
+    turfStats.update(stats);
   }
   pruneActivityEvents(ctx);
 }
@@ -1377,7 +1789,7 @@ function simulateVolunteerStep(ctx: any, row: any, effectiveTickMs: number) {
     return 0;
   }
 
-  const stepMeters = walkingStepMeters(effectiveTickMs);
+  const stepMeters = walkingStepMeters(ctx, effectiveTickMs);
   const waypoint = routeWaypointForVolunteer(ctx, row);
   if (waypoint) {
     const routeDistance = distanceMeters(row.lat, row.lng, waypoint.lat, waypoint.lng);
@@ -1450,8 +1862,7 @@ function ensureTargetVoter(ctx: any, row: any) {
         distanceBetween(routePoint.lat, routePoint.lng, b.lat, b.lng)
     );
   }
-  const next =
-    candidates[Math.floor(Math.random() * Math.min(12, candidates.length))];
+  const next = candidates[randomIndex(ctx, Math.min(12, candidates.length))];
   row.target_voter_id = next.id;
   ctx.db.volunteer.id.update(row);
   return next;
@@ -1467,13 +1878,13 @@ function routeWaypointForVolunteer(ctx: any, row: any) {
 }
 
 function applySimulatedContact(ctx: any, row: any, target: any) {
-  const roll = Math.random();
+  const roll = ctx.random();
   let status = STATUS_REFUSED;
   if (roll < SIM_LITERATURE_RATE) {
     status = STATUS_LITERATURE;
   } else if (roll < SIM_LITERATURE_RATE + SIM_CONTACT_RATE) {
     status =
-      Math.random() < SIM_DONATION_WITHIN_CONTACT_RATE
+      ctx.random() < SIM_DONATION_WITHIN_CONTACT_RATE
         ? STATUS_DONATED
         : STATUS_CONTACTED;
   } else if (roll >= 1 - SIM_REFUSED_RATE) {
@@ -1484,7 +1895,7 @@ function applySimulatedContact(ctx: any, row: any, target: any) {
   target.last_contacted_by = row.id;
   target.attempt_count += 1;
   target.donation_cents =
-    status === STATUS_DONATED ? 2500 + Math.floor(Math.random() * 17500) : 0;
+    status === STATUS_DONATED ? 2500 + ctx.random.integerInRange(0, 17499) : 0;
   target.updated_seq += 1;
   ctx.db.voter.id.update(target);
 
@@ -1532,13 +1943,20 @@ function moveTowardCoordinate(
   };
 }
 
-function walkingStepMeters(effectiveTickMs: number) {
-  const jitter = 0.85 + Math.random() * 0.3;
+function walkingStepMeters(ctx: any, effectiveTickMs: number) {
+  const jitter = 0.85 + ctx.random() * 0.3;
   return WALKING_SPEED_MPS * (effectiveTickMs / 1000) * jitter;
 }
 
-function randomHeading() {
-  return Math.random() * Math.PI * 2;
+function randomHeading(ctx: any) {
+  return ctx.random() * Math.PI * 2;
+}
+
+function randomIndex(ctx: any, length: number) {
+  if (length <= 1) {
+    return 0;
+  }
+  return ctx.random.integerInRange(0, length - 1);
 }
 
 function clampU32(value: number, min: number, max: number) {

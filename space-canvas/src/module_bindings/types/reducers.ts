@@ -7,7 +7,10 @@ import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
 import ClaimTurfReducer from "../claim_turf_reducer";
+import ClearDerivedDataReducer from "../clear_derived_data_reducer";
 import CompleteTurfReducer from "../complete_turf_reducer";
+import ImportDerivedDataBatchReducer from "../import_derived_data_batch_reducer";
+import ImportDerivedDataJsonBatchReducer from "../import_derived_data_json_batch_reducer";
 import ImportRegisteredVotersReducer from "../import_registered_voters_reducer";
 import ResetDemoDataReducer from "../reset_demo_data_reducer";
 import SeedSimulationReducer from "../seed_simulation_reducer";
@@ -17,7 +20,10 @@ import UpdateVolunteerLocationReducer from "../update_volunteer_location_reducer
 import UpdateVoterStatusReducer from "../update_voter_status_reducer";
 
 export type ClaimTurfParams = __Infer<typeof ClaimTurfReducer>;
+export type ClearDerivedDataParams = __Infer<typeof ClearDerivedDataReducer>;
 export type CompleteTurfParams = __Infer<typeof CompleteTurfReducer>;
+export type ImportDerivedDataBatchParams = __Infer<typeof ImportDerivedDataBatchReducer>;
+export type ImportDerivedDataJsonBatchParams = __Infer<typeof ImportDerivedDataJsonBatchReducer>;
 export type ImportRegisteredVotersParams = __Infer<typeof ImportRegisteredVotersReducer>;
 export type ResetDemoDataParams = __Infer<typeof ResetDemoDataReducer>;
 export type SeedSimulationParams = __Infer<typeof SeedSimulationReducer>;

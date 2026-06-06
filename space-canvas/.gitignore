@@ -1,6 +1,7 @@
 node_modules
 dist
 .spacetime
+.vercel
 *.log
 .env
 .env.local
@@ -9,3 +10,8 @@ dist
 .DS_Store
 
 spacetime.local.json
+
+data/*.json
+data/*.jsonl
+data/*.csv
+!data/.gitkeep

@@ -33,6 +33,30 @@ const RegisteredVoterImportRow = t.object('RegisteredVoterImportRow', {
   payload: t.string(),
 });
 
+const DerivedTurfImportRow = t.object('DerivedTurfImportRow', {
+  id: t.u32(),
+  name: t.string(),
+  neighborhood: t.string(),
+  centerLat: t.f64(),
+  centerLng: t.f64(),
+  boundary: t.array(Coordinate),
+  walkRoute: t.array(Coordinate),
+});
+
+const DerivedVoterImportRow = t.object('DerivedVoterImportRow', {
+  id: t.u32(),
+  turfId: t.u32(),
+  householdKey: t.string(),
+  registeredVoterCount: t.u32(),
+  householdName: t.string(),
+  address: t.string(),
+  precinct: t.string(),
+  sourceCity: t.string(),
+  sourceZip5: t.string(),
+  lat: t.f64(),
+  lng: t.f64(),
+});
+
 const tablesSchema = schema({
   turf: table(
     { name: 'turf', indexes: [], constraints: [] },
@@ -175,6 +199,16 @@ const reducersSchema = reducers(
     rows: t.array(RegisteredVoterImportRow),
   }),
   reducerSchema('reset_demo_data', {}),
+  reducerSchema('clear_derived_data', {}),
+  reducerSchema('import_derived_data_batch', {
+    turfs: t.array(DerivedTurfImportRow),
+    voters: t.array(DerivedVoterImportRow),
+    finalBatch: t.bool(),
+  }),
+  reducerSchema('import_derived_data_json_batch', {
+    payloadJson: t.string(),
+    finalBatch: t.bool(),
+  }),
   reducerSchema('claim_turf', {
     displayName: t.string(),
     preferredTurfId: t.u32(),

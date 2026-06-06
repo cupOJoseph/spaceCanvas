@@ -21,7 +21,8 @@ body {
 }
 
 button,
-input {
+input,
+a.apk-download {
   font: inherit;
 }
 
@@ -254,6 +255,14 @@ h3 {
   max-width: 420px;
 }
 
+.sim-map-panel {
+  margin-bottom: 14px;
+}
+
+.sim-map-panel .map-wrap {
+  min-height: 520px;
+}
+
 .metric-row {
   display: grid;
   gap: 10px;
@@ -418,7 +427,7 @@ h3 {
 }
 
 .mapbox-canvas {
-  z-index: 1;
+  z-index: auto;
 }
 
 .map-overlay {
@@ -426,6 +435,18 @@ h3 {
   pointer-events: none;
   width: 100%;
   z-index: 2;
+}
+
+.map-wrap .mapboxgl-control-container {
+  position: absolute;
+  z-index: 5;
+}
+
+.map-wrap .mapboxgl-ctrl-top-left,
+.map-wrap .mapboxgl-ctrl-top-right,
+.map-wrap .mapboxgl-ctrl-bottom-left,
+.map-wrap .mapboxgl-ctrl-bottom-right {
+  pointer-events: auto;
 }
 
 .map-error {
@@ -594,6 +615,16 @@ h3 {
   overflow: auto;
 }
 
+.local-feed {
+  align-content: start;
+  max-height: calc(100vh - 188px);
+  overflow: hidden;
+}
+
+.sim-complete-row {
+  border-color: #16835a;
+}
+
 .voter-row,
 .event-row,
 .mobile-voter {
@@ -758,6 +789,39 @@ h3 {
   font-weight: 800;
   justify-content: space-between;
   margin-bottom: 14px;
+}
+
+.phone-top > span {
+  min-width: 0;
+}
+
+.apk-download {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #c5cec7;
+  border-radius: 7px;
+  color: #17212f;
+  display: inline-flex;
+  font-size: 0.78rem;
+  font-weight: 900;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 10px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.apk-download:hover {
+  border-color: #476b54;
+  box-shadow: 0 1px 0 rgba(23, 33, 47, 0.08);
+}
+
+.apk-download-standalone {
+  font-size: 0.88rem;
+  margin-bottom: 14px;
+  min-height: 44px;
+  text-transform: lowercase;
+  width: min(100%, 440px);
 }
 
 .mobile-hero {
@@ -1003,6 +1067,7 @@ button.mobile-voter:disabled {
   display: grid;
   gap: 10px;
   grid-template-columns: 110px 70px minmax(0, 1fr);
+  transition: transform 180ms ease, opacity 180ms ease;
 }
 
 .distribution > div > span {
@@ -1017,6 +1082,53 @@ button.mobile-voter:disabled {
 
 .distribution div div span {
   background: #6d5b98;
+  transition: width 280ms ease;
+}
+
+.distribution > div.complete {
+  animation: turf-complete-shake 520ms ease both;
+}
+
+.distribution > div.complete div {
+  animation: turf-complete-tada 720ms ease both;
+}
+
+.distribution > div.complete div span {
+  background: #16835a;
+}
+
+@keyframes turf-complete-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-3px);
+  }
+  40% {
+    transform: translateX(3px);
+  }
+  60% {
+    transform: translateX(-2px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+@keyframes turf-complete-tada {
+  0% {
+    box-shadow: 0 0 0 rgba(22, 131, 90, 0);
+    transform: scale(1);
+  }
+  45% {
+    box-shadow: 0 0 0 5px rgba(22, 131, 90, 0.24);
+    transform: scale(1.025);
+  }
+  100% {
+    box-shadow: 0 0 0 rgba(22, 131, 90, 0);
+    transform: scale(1);
+  }
 }
 
 @media (max-width: 1100px) {
@@ -1148,6 +1260,17 @@ button {
 }
 
 button:hover:not(:disabled) {
+  border-color: var(--neo-black);
+  box-shadow: 2px 2px 0 var(--neo-black);
+  transform: translate(2px, 2px);
+}
+
+a.apk-download {
+  border: 3px solid var(--neo-black);
+  box-shadow: 4px 4px 0 var(--neo-black);
+}
+
+a.apk-download:hover {
   border-color: var(--neo-black);
   box-shadow: 2px 2px 0 var(--neo-black);
   transform: translate(2px, 2px);

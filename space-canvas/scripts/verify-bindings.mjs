@@ -33,6 +33,8 @@ const requiredTables = [
 const requiredReducers = [
   'importRegisteredVoters',
   'resetDemoData',
+  'clearDerivedData',
+  'importDerivedDataBatch',
   'claimTurf',
   'updateVolunteerLocation',
   'updateVoterStatus',
@@ -50,6 +52,8 @@ function canonicalType(text) {
     .replaceAll('__t.', 't.')
     .replaceAll('Coordinate', 'coordinate')
     .replaceAll('RegisteredVoterImportRow', 'registeredVoterImportRow')
+    .replaceAll('DerivedTurfImportRow', 'derivedTurfImportRow')
+    .replaceAll('DerivedVoterImportRow', 'derivedVoterImportRow')
     .replace(/\.name\(["'][^"']+["']\)/g, '');
 }
 

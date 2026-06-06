@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.spacecanvas.fieldops',
-  appName: 'Arlington Turf Live Ops',
+  appName: 'Travis County Turf Live Ops',
   webDir: 'dist',
   backgroundColor: '#dbeafe',
   server: {

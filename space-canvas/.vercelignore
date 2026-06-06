@@ -1,0 +1,16 @@
+node_modules
+dist
+.spacetime
+.vercel
+
+android
+ios
+data
+spacetimedb
+
+*.log
+.DS_Store
+.env
+.env.local
+.env.*.local
+tsconfig.tsbuildinfo
