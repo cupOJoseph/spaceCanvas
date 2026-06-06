@@ -1,0 +1,16 @@
+{
+  "name": "Arlington Turf Live Ops",
+  "short_name": "Turf Ops",
+  "description": "Realtime SpacetimeDB canvassing dashboard and mobile field app.",
+  "start_url": "/#mobile",
+  "display": "standalone",
+  "background_color": "#f4f6f3",
+  "theme_color": "#17212f",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    }
+  ]
+}
