@@ -677,7 +677,7 @@ export const seedSimulation = spacetimedb.reducer(
         current_turf_id: assignedTurf.id,
         lat: routePoint.lat,
         lng: routePoint.lng,
-        heading: randomHeading(),
+        heading: randomHeading(ctx),
         active: true,
         is_simulated: true,
         target_voter_id: 0,
@@ -858,21 +858,32 @@ function importDerivedRows(
     const voterRow = {
       id: imported.id,
       turf_id: imported.turfId,
+      turfId: imported.turfId,
       household_key: imported.householdKey,
+      householdKey: imported.householdKey,
       registered_voter_count: imported.registeredVoterCount,
+      registeredVoterCount: imported.registeredVoterCount,
       household_name: imported.householdName,
+      householdName: imported.householdName,
       address: imported.address,
       precinct: imported.precinct,
       source_city: imported.sourceCity,
+      sourceCity: imported.sourceCity,
       source_zip5: imported.sourceZip5,
+      sourceZip5: imported.sourceZip5,
       lat: imported.lat,
       lng: imported.lng,
       status: STATUS_NOT_CONTACTED,
       last_contacted_at: undefined,
+      lastContactedAt: undefined,
       last_contacted_by: undefined,
+      lastContactedBy: undefined,
       attempt_count: 0,
+      attemptCount: 0,
       donation_cents: 0,
+      donationCents: 0,
       updated_seq: 0,
+      updatedSeq: 0,
     };
     if (existing) {
       Object.assign(existing, voterRow);
@@ -890,12 +901,7 @@ function importDerivedRows(
 
   for (const turfIdText of Object.keys(touchedTurfs)) {
     const turfId = Number(turfIdText);
-    const turfStats = ctx.db.turfStats.turfId ?? ctx.db.turfStats.turf_id;
-    const stats = turfStats.find(turfId);
-    if (stats) {
-      stats.update_count += 1;
-      turfStats.update(stats);
-    }
+    recomputeTurfStats(ctx, turfId);
   }
 
   if (finalBatch) {
@@ -1354,7 +1360,7 @@ function chooseTurf(ctx: any, preferredTurfId: number) {
   if (turfs.length === 0) {
     throw new Error('No turfs are available');
   }
-  return turfs[Math.floor(Math.random() * turfs.length)];
+  return turfs[randomIndex(ctx, turfs.length)];
 }
 
 function findHumanVolunteerForSender(ctx: any) {
@@ -1450,7 +1456,7 @@ function recomputeTurfStats(ctx: any, turfId: number) {
   let refused = 0;
   let donated = 0;
   for (const row of ctx.db.voter.by_turf.filter(turfId)) {
-    const weight = row.registered_voter_count || 1;
+    const weight = registeredVoterWeight(row);
     total += weight;
     if (row.status === STATUS_CONTACTED) contacted += weight;
     else if (row.status === STATUS_LITERATURE) literature += weight;
@@ -1491,6 +1497,31 @@ function recomputeTurfStats(ctx: any, turfId: number) {
       last_event_at: undefined,
     });
   }
+}
+
+function registeredVoterWeight(row: any) {
+  return optionNumber(
+    row.registered_voter_count ?? row.registeredVoterCount,
+    1
+  );
+}
+
+function optionNumber(value: any, fallback: number) {
+  if (typeof value === 'number') {
+    return Math.max(1, value);
+  }
+  if (value && typeof value === 'object') {
+    if (typeof value.some === 'number') {
+      return Math.max(1, value.some);
+    }
+    if (typeof value.value === 'number') {
+      return Math.max(1, value.value);
+    }
+    if (typeof value.Some === 'number') {
+      return Math.max(1, value.Some);
+    }
+  }
+  return fallback;
 }
 
 function logActivity(
@@ -1578,7 +1609,7 @@ function simulateVolunteerStep(ctx: any, row: any, effectiveTickMs: number) {
     return 0;
   }
 
-  const stepMeters = walkingStepMeters(effectiveTickMs);
+  const stepMeters = walkingStepMeters(ctx, effectiveTickMs);
   const waypoint = routeWaypointForVolunteer(ctx, row);
   if (waypoint) {
     const routeDistance = distanceMeters(row.lat, row.lng, waypoint.lat, waypoint.lng);
@@ -1651,8 +1682,7 @@ function ensureTargetVoter(ctx: any, row: any) {
         distanceBetween(routePoint.lat, routePoint.lng, b.lat, b.lng)
     );
   }
-  const next =
-    candidates[Math.floor(Math.random() * Math.min(12, candidates.length))];
+  const next = candidates[randomIndex(ctx, Math.min(12, candidates.length))];
   row.target_voter_id = next.id;
   ctx.db.volunteer.id.update(row);
   return next;
@@ -1668,13 +1698,13 @@ function routeWaypointForVolunteer(ctx: any, row: any) {
 }
 
 function applySimulatedContact(ctx: any, row: any, target: any) {
-  const roll = Math.random();
+  const roll = ctx.random();
   let status = STATUS_REFUSED;
   if (roll < SIM_LITERATURE_RATE) {
     status = STATUS_LITERATURE;
   } else if (roll < SIM_LITERATURE_RATE + SIM_CONTACT_RATE) {
     status =
-      Math.random() < SIM_DONATION_WITHIN_CONTACT_RATE
+      ctx.random() < SIM_DONATION_WITHIN_CONTACT_RATE
         ? STATUS_DONATED
         : STATUS_CONTACTED;
   } else if (roll >= 1 - SIM_REFUSED_RATE) {
@@ -1685,7 +1715,7 @@ function applySimulatedContact(ctx: any, row: any, target: any) {
   target.last_contacted_by = row.id;
   target.attempt_count += 1;
   target.donation_cents =
-    status === STATUS_DONATED ? 2500 + Math.floor(Math.random() * 17500) : 0;
+    status === STATUS_DONATED ? 2500 + ctx.random.integerInRange(0, 17499) : 0;
   target.updated_seq += 1;
   ctx.db.voter.id.update(target);
 
@@ -1733,13 +1763,20 @@ function moveTowardCoordinate(
   };
 }
 
-function walkingStepMeters(effectiveTickMs: number) {
-  const jitter = 0.85 + Math.random() * 0.3;
+function walkingStepMeters(ctx: any, effectiveTickMs: number) {
+  const jitter = 0.85 + ctx.random() * 0.3;
   return WALKING_SPEED_MPS * (effectiveTickMs / 1000) * jitter;
 }
 
-function randomHeading() {
-  return Math.random() * Math.PI * 2;
+function randomHeading(ctx: any) {
+  return ctx.random() * Math.PI * 2;
+}
+
+function randomIndex(ctx: any, length: number) {
+  if (length <= 1) {
+    return 0;
+  }
+  return ctx.random.integerInRange(0, length - 1);
 }
 
 function clampU32(value: number, min: number, max: number) {

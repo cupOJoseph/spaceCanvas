@@ -1,6 +1,7 @@
 node_modules
 dist
 .spacetime
+.vercel
 *.log
 .env
 .env.local
@@ -11,4 +12,5 @@ dist
 spacetime.local.json
 
 data/*.json
+data/*.csv
 !data/.gitkeep
