@@ -17,7 +17,7 @@ const LIMIT = intEnv('GEOCODE_LIMIT', 0);
 const BATCH_SIZE = Math.min(1000, intEnv('GEOCODE_BATCH_SIZE', 1000));
 const BATCH_DELAY_MS = intEnv('GEOCODE_BATCH_DELAY_MS', 250);
 const TRAVIS_BBOX = [-98.173, 30.024, -97.37, 30.628];
-const ACCEPTED_ACCURACY = new Set(['parcel', 'point']);
+const ACCEPTED_ACCURACY = new Set(['parcel', 'point', 'rooftop', 'interpolated']);
 const ACCEPTED_CONFIDENCE = new Set(['exact', 'high', 'medium']);
 
 if (!MAPBOX_TOKEN && !DRY_RUN) {
@@ -92,11 +92,13 @@ async function geocodeBatch(batch) {
   if (!response.ok) {
     throw new Error(`Mapbox geocoding failed: ${response.status} ${await response.text()}`);
   }
-  return response.json();
+  const parsed = await response.json();
+  return Array.isArray(parsed?.batch) ? parsed.batch : parsed;
 }
 
 function cacheRecords(row, result) {
   const feature = firstFeature(result);
+  const resultCount = Array.isArray(result?.features) ? result.features.length : 0;
   const coordinates = feature?.geometry?.coordinates;
   const lng = Number(coordinates?.[0]);
   const lat = Number(coordinates?.[1]);
@@ -104,11 +106,7 @@ function cacheRecords(row, result) {
   const accuracy = properties.coordinates?.accuracy ?? properties.accuracy ?? '';
   const confidence = properties.match_code?.confidence ?? '';
   const accepted =
-    Number.isFinite(lat) &&
-    Number.isFinite(lng) &&
-    insideTravisBounds({ lat, lng }) &&
-    ACCEPTED_ACCURACY.has(String(accuracy)) &&
-    ACCEPTED_CONFIDENCE.has(String(confidence));
+    isAcceptedGeocode({ accuracy, confidence, lat, lng });
 
   return row.householdKeys.map(householdKey => ({
     accepted,
@@ -121,6 +119,7 @@ function cacheRecords(row, result) {
     mapbox_id: properties.mapbox_id,
     provider: 'mapbox-v6',
     query_key: row.queryKey,
+    result_count: resultCount,
     updated_at: new Date().toISOString(),
   }));
 }
@@ -201,6 +200,9 @@ function loadCache(filePath) {
     }
     try {
       const record = JSON.parse(line);
+      if (!isUsableCacheRecord(record)) {
+        continue;
+      }
       if (record.household_key) {
         cache.set(record.household_key, record);
       }
@@ -209,6 +211,29 @@ function loadCache(filePath) {
     }
   }
   return cache;
+}
+
+function isUsableCacheRecord(record) {
+  if (record?.provider !== 'mapbox-v6') {
+    return true;
+  }
+  return (
+    typeof record.result_count === 'number' ||
+    record.accepted === true ||
+    Number.isFinite(record.lat) ||
+    Number.isFinite(record.lng) ||
+    Boolean(record.mapbox_id)
+  );
+}
+
+function isAcceptedGeocode(record) {
+  return (
+    Number.isFinite(record.lat) &&
+    Number.isFinite(record.lng) &&
+    insideTravisBounds(record) &&
+    ACCEPTED_ACCURACY.has(String(record.accuracy)) &&
+    ACCEPTED_CONFIDENCE.has(String(record.confidence))
+  );
 }
 
 function buildHouseholdKey(parsed) {

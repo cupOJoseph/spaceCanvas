@@ -561,7 +561,7 @@ function coordinateFor(row, parsed, key) {
     return { lat, lng };
   }
   const cached = geocodeCache.get(key);
-  if (cached?.accepted && insideBounds(cached)) {
+  if (isAcceptedCachedGeocode(cached)) {
     coordinateStats.geocoded += 1;
     return { lat: cached.lat, lng: cached.lng };
   }
@@ -660,6 +660,19 @@ function loadGeocodeCache(filePath) {
   }
   console.log(`Loaded ${cache.size.toLocaleString()} cached Travis geocodes from ${filePath}`);
   return cache;
+}
+
+function isAcceptedCachedGeocode(record) {
+  if (!record || !insideBounds(record)) {
+    return false;
+  }
+  if (record.accepted === true) {
+    return true;
+  }
+  return (
+    ['parcel', 'point', 'rooftop', 'interpolated'].includes(String(record.accuracy)) &&
+    ['exact', 'high', 'medium'].includes(String(record.confidence))
+  );
 }
 
 function numberValue(value) {
