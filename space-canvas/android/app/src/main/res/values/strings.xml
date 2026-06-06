@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Arlington Turf Live Ops</string>
+    <string name="title_activity_main">Arlington Turf Live Ops</string>
+    <string name="package_name">com.spacecanvas.fieldops</string>
+    <string name="custom_url_scheme">com.spacecanvas.fieldops</string>
+</resources>
