@@ -141,3 +141,8 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Local voter source exports and generated derived artifacts
+data/*.csv
+data/*.json
+!data/.gitkeep

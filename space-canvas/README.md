@@ -31,6 +31,46 @@ Known incomplete work:
 - The README still keeps older Arlington/demo language in some lower sections for historical local fallback behavior; those docs should be cleaned up after the chunked Travis pipeline lands.
 - Final end-to-end prod demo verification is not complete until derived Travis turfs are populated and the one-button simulator is run against those rows.
 
+### Local Static Travis Turf Cut
+
+The Travis voter CSV is intentionally local-only and ignored by git:
+
+```text
+../data/travis-county-Registered_Voter_List.csv
+```
+
+Cut turfs locally once and write the static derived artifact:
+
+```bash
+npm run materialize:travis:export
+```
+
+The local cut completed with:
+
+```text
+929,802 registered voters
+493,558 household knock targets
+4,664 roughly 200-voter turfs
+```
+
+The generated artifact is also ignored by git because it is large:
+
+```text
+data/travis-derived-turfs.json
+```
+
+Import that static artifact into SpacetimeDB in bounded reducer batches:
+
+```bash
+npm run materialize:travis:import
+```
+
+Or export and import in one run:
+
+```bash
+npm run materialize:travis
+```
+
 ## What It Demonstrates
 
 - SpacetimeDB as the database and backend: tables hold turf, voter, volunteer GPS, event, aggregate, and simulator state.

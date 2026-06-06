@@ -30,6 +30,36 @@ export const Coordinate = __t.object("Coordinate", {
 });
 export type Coordinate = __Infer<typeof Coordinate>;
 
+export const DerivedTurfImportRow = __t.object("DerivedTurfImportRow", {
+  id: __t.u32(),
+  name: __t.string(),
+  neighborhood: __t.string(),
+  centerLat: __t.f64(),
+  centerLng: __t.f64(),
+  get boundary() {
+    return __t.array(Coordinate);
+  },
+  get walkRoute() {
+    return __t.array(Coordinate);
+  },
+});
+export type DerivedTurfImportRow = __Infer<typeof DerivedTurfImportRow>;
+
+export const DerivedVoterImportRow = __t.object("DerivedVoterImportRow", {
+  id: __t.u32(),
+  turfId: __t.u32(),
+  householdKey: __t.string(),
+  registeredVoterCount: __t.u32(),
+  householdName: __t.string(),
+  address: __t.string(),
+  precinct: __t.string(),
+  sourceCity: __t.string(),
+  sourceZip5: __t.string(),
+  lat: __t.f64(),
+  lng: __t.f64(),
+});
+export type DerivedVoterImportRow = __Infer<typeof DerivedVoterImportRow>;
+
 export const RegisteredVoter = __t.object("RegisteredVoter", {
   vuid: __t.string(),
   name: __t.string(),

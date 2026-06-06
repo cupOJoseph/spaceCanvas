@@ -1,10 +1,27 @@
 import * as turf from '@turf/turf';
+import { createReadStream, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { dirname } from 'node:path';
 import { DbConnection, defaultDatabase, defaultHost } from './spacetime-client.mjs';
 
 const TARGET_VOTERS_PER_TURF = intEnv('TARGET_VOTERS_PER_TURF', 200);
 const TURF_BATCH_SIZE = intEnv('TURF_BATCH_SIZE', 20);
 const VOTER_BATCH_SIZE = intEnv('VOTER_BATCH_SIZE', 1200);
 const MATERIALIZE_LIMIT = intEnv('MATERIALIZE_LIMIT', 0);
+const ARTIFACT_PATH =
+  process.env.DERIVED_ARTIFACT_PATH ?? 'data/travis-derived-turfs.json';
+const CSV_PATH =
+  process.env.TRAVIS_VOTER_CSV ??
+  new URL('../../data/travis-county-Registered_Voter_List.csv', import.meta.url)
+    .pathname;
+const args = new Set(process.argv.slice(2));
+const mode = args.has('--export')
+  ? args.has('--import')
+    ? 'export-import'
+    : 'export'
+  : args.has('--import')
+    ? 'import'
+    : process.env.MATERIALIZE_MODE ?? 'export-import';
 const TRAVIS_CENTER = { lat: 30.2672, lng: -97.7431 };
 const TRAVIS_BOUNDS = {
   maxLat: 30.628,
@@ -35,27 +52,37 @@ const CITY_CENTERS = {
 const token = process.env.SPACETIMEDB_TOKEN;
 let connection;
 
+if (mode === 'export') {
+  void exportArtifactFromCsv().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+} else {
+  connect();
+}
+
+function connect() {
 const builder = DbConnection.builder()
   .withUri(defaultHost)
   .withDatabaseName(defaultDatabase)
   .onConnect(conn => {
     connection = conn;
     console.log(`Connected to ${defaultHost}/${defaultDatabase}`);
-    conn
-      .subscriptionBuilder()
-      .onApplied(() => {
-        void materialize().catch(error => {
-          console.error(error);
-          process.exitCode = 1;
-          disconnect();
-        });
-      })
-      .onError((_ctx, error) => {
-        console.error('registered_voter subscription failed:', error.message);
+    if (mode === 'import') {
+      void importArtifact().catch(error => {
+        console.error(error);
         process.exitCode = 1;
         disconnect();
-      })
-      .subscribe('SELECT * FROM registered_voter');
+      });
+      return;
+    }
+    void exportArtifactFromCsv()
+      .then(importArtifact)
+      .catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+        disconnect();
+      });
   })
   .onConnectError((_ctx, error) => {
     console.error('Connection failed:', error.message);
@@ -67,81 +94,154 @@ if (token) {
 }
 
 builder.build();
+}
 
-async function materialize() {
-  const rows = Array.from(connection.db.registeredVoter.iter());
-  const sourceRows = MATERIALIZE_LIMIT > 0 ? rows.slice(0, MATERIALIZE_LIMIT) : rows;
+async function exportArtifactFromCsv() {
+  const households = await groupHouseholdsFromCsv(CSV_PATH);
   console.log(
-    `Loaded ${rows.length.toLocaleString()} registered voters; materializing ${sourceRows.length.toLocaleString()}`
+    `Grouped ${households.length.toLocaleString()} household targets from ${CSV_PATH}`
   );
-
-  const households = groupHouseholds(sourceRows);
-  console.log(`Grouped ${households.length.toLocaleString()} household targets`);
 
   const turfs = buildTurfs(households);
   console.log(`Built ${turfs.length.toLocaleString()} ${TARGET_VOTERS_PER_TURF}-voter turfs`);
 
+  writeArtifact({
+    meta: {
+      createdAt: new Date().toISOString(),
+      sourceRows: households.reduce(
+        (sum, row) => sum + row.registered_voter_count,
+        0
+      ),
+      targetVotersPerTurf: TARGET_VOTERS_PER_TURF,
+      turfCount: turfs.length,
+      voterCount: households.length,
+    },
+    turfs,
+    voters: households,
+  });
+}
+
+async function importArtifact() {
+  const artifact = JSON.parse(readFileSync(ARTIFACT_PATH, 'utf8'));
+  console.log(
+    `Loaded static artifact ${ARTIFACT_PATH}: ${artifact.turfs.length.toLocaleString()} turfs, ${artifact.voters.length.toLocaleString()} households`
+  );
+  await importRows(artifact);
+  disconnect();
+}
+
+async function importRows({ turfs, voters }) {
   console.log('Clearing derived realtime tables');
   await connection.reducers.clearDerivedData();
 
   let turfIndex = 0;
   let voterIndex = 0;
-  while (turfIndex < turfs.length || voterIndex < households.length) {
+  while (turfIndex < turfs.length || voterIndex < voters.length) {
     const turfBatch = turfs.slice(turfIndex, turfIndex + TURF_BATCH_SIZE);
-    const voterBatch = households.slice(voterIndex, voterIndex + VOTER_BATCH_SIZE);
+    const voterBatch = voters.slice(voterIndex, voterIndex + VOTER_BATCH_SIZE);
     turfIndex += turfBatch.length;
     voterIndex += voterBatch.length;
-    const finalBatch = turfIndex >= turfs.length && voterIndex >= households.length;
+    const finalBatch = turfIndex >= turfs.length && voterIndex >= voters.length;
     await connection.reducers.importDerivedDataBatch({
       finalBatch,
       turfs: turfBatch,
       voters: voterBatch,
     });
     console.log(
-      `Imported turfs=${turfIndex.toLocaleString()}/${turfs.length.toLocaleString()} households=${voterIndex.toLocaleString()}/${households.length.toLocaleString()}`
+      `Imported turfs=${turfIndex.toLocaleString()}/${turfs.length.toLocaleString()} households=${voterIndex.toLocaleString()}/${voters.length.toLocaleString()}`
     );
   }
 
   console.log('Travis materialization complete');
-  disconnect();
+}
+
+function writeArtifact(artifact) {
+  mkdirSync(dirname(ARTIFACT_PATH), { recursive: true });
+  writeFileSync(ARTIFACT_PATH, `${JSON.stringify(artifact)}\n`);
+  console.log(
+    `Wrote static Travis turf artifact ${ARTIFACT_PATH} (${artifact.turfs.length.toLocaleString()} turfs, ${artifact.voters.length.toLocaleString()} households)`
+  );
 }
 
 function groupHouseholds(rows) {
   const households = new Map();
   for (const row of rows) {
     const parsed = parsePayload(row.payload);
-    const key = householdKey(row, parsed);
-    if (!key) {
+    addRegisteredRowToHouseholds(households, row, parsed);
+  }
+  return finalizeHouseholds(households);
+}
+
+async function groupHouseholdsFromCsv(filePath) {
+  const households = new Map();
+  const input = createReadStream(filePath, { encoding: 'utf8' });
+  const reader = createInterface({ crlfDelay: Infinity, input });
+  let headers;
+  let sourceRows = 0;
+
+  for await (const line of reader) {
+    if (!headers) {
+      headers = parseCsvLine(stripBom(line));
       continue;
     }
-    const existing = households.get(key);
-    if (existing) {
-      existing.registered_voter_count += 1;
-      addName(existing, row.name || parsed.NAME || '');
+    if (!line.trim()) {
       continue;
     }
-    const city = cleanUpper(row.city || parsed.City || 'AUSTIN');
-    const zip5 = clean(row.zip5 || parsed['Zip Code 5']);
-    const precinct = clean(row.precinct || parsed.Precinct || 'Unassigned');
-    const point = coordinateFor(row, parsed, key);
-    const household = {
-      address: displayAddress(parsed),
-      city,
-      household_key: key,
-      id: 0,
-      lat: point.lat,
-      lng: point.lng,
-      names: [],
-      precinct,
-      registered_voter_count: 1,
-      source_city: city,
-      source_zip5: zip5,
-      turf_id: 0,
+    if (MATERIALIZE_LIMIT > 0 && sourceRows >= MATERIALIZE_LIMIT) {
+      break;
+    }
+    sourceRows += 1;
+    const parsed = csvObject(headers, parseCsvLine(line));
+    const row = {
+      city: cleanUpper(parsed.City),
+      name: clean(parsed.NAME),
+      precinct: clean(parsed.Precinct),
+      zip5: clean(parsed['Zip Code 5']),
     };
-    addName(household, row.name || parsed.NAME || '');
-    households.set(key, household);
+    addRegisteredRowToHouseholds(households, row, parsed);
+    if (sourceRows % 100000 === 0) {
+      console.log(`Read ${sourceRows.toLocaleString()} CSV voter rows`);
+    }
   }
 
+  console.log(`Read ${sourceRows.toLocaleString()} CSV voter rows`);
+  return finalizeHouseholds(households);
+}
+
+function addRegisteredRowToHouseholds(households, row, parsed) {
+  const key = householdKey(row, parsed);
+  if (!key) {
+    return;
+  }
+  const existing = households.get(key);
+  if (existing) {
+    existing.registered_voter_count += 1;
+    addName(existing, row.name || parsed.NAME || '');
+    return;
+  }
+  const city = cleanUpper(row.city || parsed.City || 'AUSTIN');
+  const zip5 = clean(row.zip5 || parsed['Zip Code 5']);
+  const precinct = clean(row.precinct || parsed.Precinct || 'Unassigned');
+  const point = coordinateFor(row, parsed, key);
+  const household = {
+    address: displayAddress(parsed),
+    city,
+    household_key: key,
+    id: 0,
+    lat: point.lat,
+    lng: point.lng,
+    names: [],
+    precinct,
+    registered_voter_count: 1,
+    source_city: city,
+    source_zip5: zip5,
+    turf_id: 0,
+  };
+  addName(household, row.name || parsed.NAME || '');
+  households.set(key, household);
+}
+
+function finalizeHouseholds(households) {
   const sorted = [...households.values()].sort(compareHouseholds);
   let id = 1;
   let turfId = 1;
@@ -214,6 +314,46 @@ function parsePayload(payload) {
   } catch {
     return {};
   }
+}
+
+function parseCsvLine(line) {
+  const values = [];
+  let value = '';
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === '"') {
+      if (quoted && line[index + 1] === '"') {
+        value += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (char === ',' && !quoted) {
+      values.push(value);
+      value = '';
+      continue;
+    }
+    value += char;
+  }
+  values.push(value);
+  return values;
+}
+
+function csvObject(headers, values) {
+  const row = {};
+  for (let index = 0; index < headers.length; index += 1) {
+    if (row[headers[index]] === undefined) {
+      row[headers[index]] = values[index] ?? '';
+    }
+  }
+  return row;
+}
+
+function stripBom(value) {
+  return value.charCodeAt(0) === 0xfeff ? value.slice(1) : value;
 }
 
 function householdKey(row, parsed) {

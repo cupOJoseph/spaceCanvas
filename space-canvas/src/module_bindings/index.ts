@@ -35,7 +35,9 @@ import {
 
 // Import all reducer arg schemas
 import ClaimTurfReducer from "./claim_turf_reducer";
+import ClearDerivedDataReducer from "./clear_derived_data_reducer";
 import CompleteTurfReducer from "./complete_turf_reducer";
+import ImportDerivedDataBatchReducer from "./import_derived_data_batch_reducer";
 import ImportRegisteredVotersReducer from "./import_registered_voters_reducer";
 import ResetDemoDataReducer from "./reset_demo_data_reducer";
 import SeedSimulationReducer from "./seed_simulation_reducer";
@@ -168,7 +170,9 @@ const tablesSchema = __schema({
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
   __reducerSchema("claim_turf", ClaimTurfReducer),
+  __reducerSchema("clear_derived_data", ClearDerivedDataReducer),
   __reducerSchema("complete_turf", CompleteTurfReducer),
+  __reducerSchema("import_derived_data_batch", ImportDerivedDataBatchReducer),
   __reducerSchema("import_registered_voters", ImportRegisteredVotersReducer),
   __reducerSchema("reset_demo_data", ResetDemoDataReducer),
   __reducerSchema("seed_simulation", SeedSimulationReducer),
