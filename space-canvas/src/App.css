@@ -487,14 +487,6 @@ h3 {
   stroke-width: 3.3;
 }
 
-.walk-route {
-  fill: none;
-  stroke: rgba(71, 107, 84, 0.58);
-  stroke-dasharray: 7 7;
-  stroke-linecap: round;
-  stroke-width: 2;
-}
-
 .turf-label {
   fill: #17212f;
   font-size: 19px;
@@ -1410,12 +1402,6 @@ a.apk-download:hover {
   fill: rgba(37, 99, 235, 0.34);
   stroke: var(--neo-blue);
   stroke-width: 7;
-}
-
-.walk-route {
-  stroke: var(--neo-blue-dark);
-  stroke-dasharray: 10 8;
-  stroke-width: 4;
 }
 
 .turf-label {

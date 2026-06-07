@@ -99,6 +99,7 @@ type LocalSimulationSnapshot = {
   completed: boolean;
   events: ActivityEvent[];
   startedAt: number | null;
+  stats: TurfStats[];
   ticks: number;
   totalVolunteerMs: number;
   voterPatches: Record<number, LocalVoterPatch>;
@@ -112,6 +113,7 @@ type RuntimeVolunteer = MapVolunteer & {
   targetAddress: string;
   targetDurationMs: number;
   targetHouseholdName: string;
+  targetRegisteredVoterCount: number;
   toLat: number;
   toLng: number;
   travelStartedAt: number;
@@ -122,6 +124,8 @@ type LocalSimulationRuntime = {
   events: ActivityEvent[];
   tickTimer: number;
   ticks: number;
+  baseActiveVolunteerCounts: Map<number, number>;
+  statsByTurf: Map<number, TurfStats>;
   totalCompletedVolunteerMs: number;
   turfQueues: Map<number, Voter[]>;
   voterPatches: Record<number, LocalVoterPatch>;
@@ -227,12 +231,9 @@ function App() {
   const updateVoterStatus = useReducer(reducers.updateVoterStatus);
   const updateVolunteerLocation = useReducer(reducers.updateVolunteerLocation);
   const completeTurf = useReducer(reducers.completeTurf);
-  const localSimulation = useLocalSimulation(turfs, voters, reportActionError);
+  const localSimulation = useLocalSimulation(turfs, voters, stats, reportActionError);
 
-  const displayedVoters = useMemo(
-    () => applyLocalVoterPatches(voters, localSimulation.snapshot.voterPatches),
-    [localSimulation.snapshot.voterPatches, voters]
-  );
+  const displayedVoters = voters;
   const displayedVolunteers = useMemo(
     () =>
       localSimulation.snapshot.events.length > 0
@@ -246,14 +247,12 @@ function App() {
   const displayedStats = useMemo(
     () =>
       localSimulation.snapshot.events.length > 0
-        ? buildStatsFromVoters(turfs, displayedVoters, displayedVolunteers)
+        ? localSimulation.snapshot.stats
         : stats,
     [
-      displayedVolunteers,
-      displayedVoters,
       localSimulation.snapshot.events.length,
+      localSimulation.snapshot.stats,
       stats,
-      turfs,
     ]
   );
   const displayedEvents = useMemo(
@@ -390,6 +389,7 @@ function App() {
           turfs={turfs}
           updateVolunteerLocation={updateVolunteerLocation}
           updateVoterStatus={updateVoterStatus}
+          voterPatches={localSimulation.snapshot.voterPatches}
           voters={displayedVoters}
           volunteers={displayedVolunteers}
         />
@@ -423,6 +423,7 @@ function App() {
           turfs={turfs}
           updateVolunteerLocation={updateVolunteerLocation}
           updateVoterStatus={updateVoterStatus}
+          voterPatches={localSimulation.snapshot.voterPatches}
           voters={displayedVoters}
           volunteers={displayedVolunteers}
         />
@@ -446,6 +447,7 @@ function Dashboard({
   turfs,
   updateVolunteerLocation,
   updateVoterStatus,
+  voterPatches,
   voters,
   volunteers,
 }: {
@@ -475,10 +477,15 @@ function Dashboard({
     lng: number;
     donationCents: number;
   }) => Promise<void>;
+  voterPatches: Record<number, LocalVoterPatch>;
   voters: readonly Voter[];
   volunteers: readonly MapVolunteer[];
 }) {
   const totals = useMemo(() => summarizeStats(stats), [stats]);
+  const statsByTurf = useMemo(
+    () => new Map(stats.map(row => [row.turfId, row])),
+    [stats]
+  );
   const liveTelemetry = useMemo(
     () => buildLiveTelemetry(events, stats, turfs, voters, volunteers),
     [events, stats, turfs, voters, volunteers]
@@ -553,13 +560,14 @@ function Dashboard({
           turfs={turfs}
           updateVolunteerLocation={updateVolunteerLocation}
           updateVoterStatus={updateVoterStatus}
+          voterPatches={voterPatches}
           voters={voters}
           volunteers={volunteers}
         />
 
         <div className="turf-strip">
           {turfs.map(turf => {
-            const row = stats.find(item => item.turfId === turf.id);
+            const row = statsByTurf.get(turf.id);
             const percent =
               row && row.totalVoters > 0
                 ? Math.round(
@@ -712,6 +720,7 @@ function TravisMap({
   turfs,
   updateVolunteerLocation,
   updateVoterStatus,
+  voterPatches = {},
   voters,
   volunteers,
 }: {
@@ -734,6 +743,7 @@ function TravisMap({
     lng: number;
     donationCents: number;
   }) => Promise<void>;
+  voterPatches?: Record<number, LocalVoterPatch>;
   voters: readonly Voter[];
   volunteers: readonly MapVolunteer[];
 }) {
@@ -754,7 +764,11 @@ function TravisMap({
     () => getBounds(mapTurfs.length > 0 ? mapTurfs : turfs),
     [mapTurfs, turfs]
   );
-  const selectedVoters = voters.filter(voter => voter.turfId === selectedTurfId);
+  const votersByTurf = useMemo(() => groupVotersByTurf(voters), [voters]);
+  const selectedVoters = useMemo(
+    () => applyLocalVoterPatches(votersByTurf.get(selectedTurfId) ?? [], voterPatches),
+    [selectedTurfId, voterPatches, votersByTurf]
+  );
   const activeVolunteers = volunteers.filter(
     volunteer => volunteer.active && volunteer.currentTurfId === selectedTurfId
   );
@@ -972,12 +986,6 @@ function TravisMap({
           const points = turf.boundary
             .map(point => project(point.lat, point.lng).join(','))
             .join(' ');
-          const routePath = turf.walkRoute
-            .map((point, index) => {
-              const [x, y] = project(point.lat, point.lng);
-              return `${index === 0 ? 'M' : 'L'} ${x} ${y}`;
-            })
-            .join(' ');
           const [labelX, labelY] = project(turf.centerLat, turf.centerLng);
           return (
             <g key={turf.id}>
@@ -986,7 +994,6 @@ function TravisMap({
                 points={points}
                 onClick={() => setSelectedTurfId(turf.id)}
               />
-              <path className="walk-route" d={routePath} />
               <text className="turf-label" x={labelX} y={labelY}>
                 {turf.name}
               </text>
@@ -1356,6 +1363,7 @@ function SimulatorPanel({
   turfs,
   updateVolunteerLocation,
   updateVoterStatus,
+  voterPatches,
   voters,
   volunteers,
 }: {
@@ -1383,6 +1391,7 @@ function SimulatorPanel({
     lng: number;
     donationCents: number;
   }) => Promise<void>;
+  voterPatches: Record<number, LocalVoterPatch>;
   voters: readonly Voter[];
   volunteers: readonly MapVolunteer[];
 }) {
@@ -1463,6 +1472,7 @@ function SimulatorPanel({
             turfs={turfs}
             updateVolunteerLocation={updateVolunteerLocation}
             updateVoterStatus={updateVoterStatus}
+            voterPatches={voterPatches}
             voters={voters}
             volunteers={volunteers}
           />
@@ -1562,6 +1572,7 @@ function SimulatorPanel({
 function useLocalSimulation(
   turfs: readonly Turf[],
   voters: readonly Voter[],
+  stats: readonly TurfStats[],
   onActionError: (label: string, error: unknown) => void
 ) {
   const runtimeRef = useRef<LocalSimulationRuntime | null>(null);
@@ -1571,6 +1582,7 @@ function useLocalSimulation(
     completed: false,
     events: [],
     startedAt: null,
+    stats: [],
     ticks: 0,
     totalVolunteerMs: 0,
     voterPatches: {},
@@ -1590,6 +1602,7 @@ function useLocalSimulation(
     setSnapshot(current => ({
       ...current,
       active: false,
+      stats: current.stats,
       volunteers: current.volunteers.map(volunteer => ({
         ...volunteer,
         active: false,
@@ -1602,11 +1615,13 @@ function useLocalSimulation(
     if (!runtime) {
       return;
     }
+    refreshLocalActiveVolunteerCounts(runtime);
     setSnapshot(current => ({
       active: true,
       completed,
       events: runtime.events.slice(0, LOCAL_SIM_FEED_LIMIT),
       startedAt: current.startedAt ?? Date.now(),
+      stats: Array.from(runtime.statsByTurf.values()),
       ticks: runtime.ticks,
       totalVolunteerMs: totalVolunteerTime(runtime, Date.now()),
       voterPatches: { ...runtime.voterPatches },
@@ -1627,6 +1642,7 @@ function useLocalSimulation(
       window.clearInterval(flushTimerRef.current);
       flushTimerRef.current = null;
     }
+    refreshLocalActiveVolunteerCounts(runtime);
     const finishedVolunteers = runtime.volunteers.map(volunteer => ({
       ...toMapVolunteer(volunteer, Date.now()),
       active: false,
@@ -1636,6 +1652,10 @@ function useLocalSimulation(
       completed: true,
       events: runtime.events.slice(0, LOCAL_SIM_FEED_LIMIT),
       startedAt: current.startedAt,
+      stats: Array.from(runtime.statsByTurf.values()).map(row => ({
+        ...row,
+        activeVolunteerCount: runtime.baseActiveVolunteerCounts.get(row.turfId) ?? 0,
+      })),
       ticks: runtime.ticks,
       totalVolunteerMs: totalVolunteerTime(runtime, Date.now()),
       voterPatches: { ...runtime.voterPatches },
@@ -1646,10 +1666,23 @@ function useLocalSimulation(
   const start = useCallback(() => {
     stop();
 
+    const turfIds = new Set(turfs.map(turf => turf.id));
+    const votersByTurf = new Map<number, Voter[]>();
+    let maxUpdatedSeq = 1;
+    for (const voter of voters) {
+      if (!turfIds.has(voter.turfId)) {
+        continue;
+      }
+      const rows = votersByTurf.get(voter.turfId) ?? [];
+      rows.push(voter);
+      votersByTurf.set(voter.turfId, rows);
+      maxUpdatedSeq = Math.max(maxUpdatedSeq, voter.updatedSeq);
+    }
+
     const availableTurfs = turfs.filter(turf =>
-      voters.some(voter => voter.turfId === turf.id)
+      (votersByTurf.get(turf.id)?.length ?? 0) > 0
     );
-    if (availableTurfs.length === 0 || voters.length === 0) {
+    if (availableTurfs.length === 0) {
       throw new Error('No subscribed turfs or voters are ready yet');
     }
 
@@ -1657,9 +1690,8 @@ function useLocalSimulation(
     const turfQueues = new Map<number, Voter[]>();
     for (const turf of availableTurfs) {
       const queue = shuffle(
-        voters.filter(
-          voter =>
-            voter.turfId === turf.id && voter.status === STATUS_NOT_CONTACTED
+        (votersByTurf.get(turf.id) ?? []).filter(
+          voter => voter.status === STATUS_NOT_CONTACTED
         )
       );
       if (queue.length > 0) {
@@ -1695,6 +1727,7 @@ function useLocalSimulation(
           targetAddress: '',
           targetDurationMs: 0,
           targetHouseholdName: '',
+          targetRegisteredVoterCount: 1,
           targetVoterId: 0,
           toLat: routePoint.lat,
           toLng: routePoint.lng,
@@ -1709,14 +1742,17 @@ function useLocalSimulation(
     const runtime: LocalSimulationRuntime = {
       eventSeq: 1,
       events: [],
+      baseActiveVolunteerCounts: buildBaseActiveVolunteerCounts(stats),
+      statsByTurf: buildLocalStatsByTurf(turfs, votersByTurf, stats),
       tickTimer: 0,
       ticks: 0,
       totalCompletedVolunteerMs: 0,
       turfQueues,
       voterPatches: {},
-      voterSeq: Math.max(1, ...voters.map(voter => voter.updatedSeq)) + 1,
+      voterSeq: maxUpdatedSeq + 1,
       volunteers,
     };
+    refreshLocalActiveVolunteerCounts(runtime);
 
     const runTick = () => {
       try {
@@ -1745,6 +1781,7 @@ function useLocalSimulation(
       completed: false,
       events: [],
       startedAt: now,
+      stats: Array.from(runtime.statsByTurf.values()),
       ticks: 0,
       totalVolunteerMs: 0,
       voterPatches: {},
@@ -1752,7 +1789,7 @@ function useLocalSimulation(
         .slice(0, LOCAL_SIM_RENDERED_VOLUNTEER_LIMIT)
         .map(volunteer => toMapVolunteer(volunteer, now)),
     });
-  }, [finish, flush, onActionError, stop, turfs, voters]);
+  }, [finish, flush, onActionError, stats, stop, turfs, voters]);
 
   useEffect(() => stop, [stop]);
 
@@ -1790,6 +1827,7 @@ function runLocalSimulationTick(
       status,
       updatedSeq: runtime.voterSeq,
     };
+    updateLocalStatsForKnock(runtime, volunteer, status, localTimestamp(now));
     runtime.totalCompletedVolunteerMs += volunteer.targetDurationMs;
     runtime.voterSeq += 1;
     volunteer.completedCount += 1;
@@ -1857,6 +1895,7 @@ function assignNextLocalTarget(
   volunteer.nextKnockAt = now + volunteer.targetDurationMs;
   volunteer.targetAddress = voter.address;
   volunteer.targetHouseholdName = voter.householdName;
+  volunteer.targetRegisteredVoterCount = registeredVoterCount(voter);
   volunteer.targetVoterId = voter.id;
   volunteer.toLat = voter.lat;
   volunteer.toLng = voter.lng;
@@ -1866,6 +1905,16 @@ function assignNextLocalTarget(
     volunteer.fromLat = nextTurf.centerLat;
     volunteer.fromLng = nextTurf.centerLng;
   }
+}
+
+function groupVotersByTurf(voters: readonly Voter[]) {
+  const votersByTurf = new Map<number, Voter[]>();
+  for (const voter of voters) {
+    const rows = votersByTurf.get(voter.turfId) ?? [];
+    rows.push(voter);
+    votersByTurf.set(voter.turfId, rows);
+  }
+  return votersByTurf;
 }
 
 function applyLocalVoterPatches(
@@ -1881,35 +1930,92 @@ function applyLocalVoterPatches(
   });
 }
 
-function buildStatsFromVoters(
+function buildLocalStatsByTurf(
   turfs: readonly Turf[],
-  voters: readonly Voter[],
-  volunteers: readonly MapVolunteer[]
+  votersByTurf: Map<number, Voter[]>,
+  stats: readonly TurfStats[]
 ) {
-  return turfs.map(turf => {
-    const turfVoters = voters.filter(voter => voter.turfId === turf.id);
-    return {
-      activeVolunteerCount: volunteers.filter(
-        volunteer => volunteer.active && volunteer.currentTurfId === turf.id
-      ).length,
-      contactedCount: turfVoters.filter(voter => voter.status === STATUS_CONTACTED)
-        .length,
-      donatedCount: turfVoters.filter(voter => voter.status === STATUS_DONATED)
-        .length,
-      lastEventAt: latestLocalEventTime(turfVoters),
-      literatureDroppedCount: turfVoters.filter(
-        voter => voter.status === STATUS_LITERATURE
-      ).length,
-      notContactedCount: turfVoters.filter(
-        voter => voter.status === STATUS_NOT_CONTACTED
-      ).length,
-      refusedCount: turfVoters.filter(voter => voter.status === STATUS_REFUSED)
-        .length,
-      totalVoters: turfVoters.length,
-      turfId: turf.id,
-      updateCount: turfVoters.filter(voter => voter.updatedSeq > 0).length,
-    };
-  });
+  const statsByTurf = new Map<number, TurfStats>();
+  for (const row of stats) {
+    statsByTurf.set(row.turfId, { ...row });
+  }
+  for (const turf of turfs) {
+    if (!statsByTurf.has(turf.id)) {
+      statsByTurf.set(turf.id, buildStatsFromVoterRows(turf.id, votersByTurf.get(turf.id) ?? []));
+    }
+  }
+  return statsByTurf;
+}
+
+function buildStatsFromVoterRows(turfId: number, voters: readonly Voter[]): TurfStats {
+  const row: TurfStats = {
+    activeVolunteerCount: 0,
+    contactedCount: 0,
+    donatedCount: 0,
+    lastEventAt: latestLocalEventTime(voters),
+    literatureDroppedCount: 0,
+    notContactedCount: 0,
+    refusedCount: 0,
+    totalVoters: 0,
+    turfId,
+    updateCount: 0,
+  };
+  for (const voter of voters) {
+    const weight = registeredVoterCount(voter);
+    row.totalVoters += weight;
+    if (voter.status === STATUS_CONTACTED) row.contactedCount += weight;
+    else if (voter.status === STATUS_LITERATURE) row.literatureDroppedCount += weight;
+    else if (voter.status === STATUS_REFUSED) row.refusedCount += weight;
+    else if (voter.status === STATUS_DONATED) row.donatedCount += weight;
+    else row.notContactedCount += weight;
+    if (voter.updatedSeq > 0) {
+      row.updateCount += 1;
+    }
+  }
+  return row;
+}
+
+function buildBaseActiveVolunteerCounts(stats: readonly TurfStats[]) {
+  const counts = new Map<number, number>();
+  for (const row of stats) {
+    counts.set(row.turfId, row.activeVolunteerCount);
+  }
+  return counts;
+}
+
+function refreshLocalActiveVolunteerCounts(runtime: LocalSimulationRuntime) {
+  for (const row of runtime.statsByTurf.values()) {
+    row.activeVolunteerCount = runtime.baseActiveVolunteerCounts.get(row.turfId) ?? 0;
+  }
+  for (const volunteer of runtime.volunteers) {
+    if (!volunteer.active) {
+      continue;
+    }
+    const row = runtime.statsByTurf.get(volunteer.currentTurfId);
+    if (row) {
+      row.activeVolunteerCount += 1;
+    }
+  }
+}
+
+function updateLocalStatsForKnock(
+  runtime: LocalSimulationRuntime,
+  volunteer: RuntimeVolunteer,
+  status: string,
+  timestamp: TimeValue
+) {
+  const row = runtime.statsByTurf.get(volunteer.currentTurfId);
+  if (!row) {
+    return;
+  }
+  const weight = volunteer.targetRegisteredVoterCount;
+  row.notContactedCount = Math.max(0, row.notContactedCount - weight);
+  if (status === STATUS_CONTACTED) row.contactedCount += weight;
+  else if (status === STATUS_LITERATURE) row.literatureDroppedCount += weight;
+  else if (status === STATUS_REFUSED) row.refusedCount += weight;
+  else if (status === STATUS_DONATED) row.donatedCount += weight;
+  row.lastEventAt = timestamp;
+  row.updateCount += 1;
 }
 
 function toMapVolunteer(volunteer: RuntimeVolunteer, now: number): MapVolunteer {
@@ -2258,14 +2364,23 @@ function buildLiveTelemetry(
 }
 
 function getBounds(turfs: readonly Turf[]) {
-  const points = turfs.flatMap(turf => turf.boundary);
-  const latValues = points.map(point => point.lat);
-  const lngValues = points.map(point => point.lng);
+  let maxLat = 30.628;
+  let maxLng = -97.37;
+  let minLat = 30.024;
+  let minLng = -98.173;
+  for (const turf of turfs) {
+    for (const point of turf.boundary) {
+      maxLat = Math.max(maxLat, point.lat);
+      maxLng = Math.max(maxLng, point.lng);
+      minLat = Math.min(minLat, point.lat);
+      minLng = Math.min(minLng, point.lng);
+    }
+  }
   return {
-    maxLat: Math.max(...latValues, 30.628),
-    maxLng: Math.max(...lngValues, -97.37),
-    minLat: Math.min(...latValues, 30.024),
-    minLng: Math.min(...lngValues, -98.173),
+    maxLat,
+    maxLng,
+    minLat,
+    minLng,
   };
 }
 
